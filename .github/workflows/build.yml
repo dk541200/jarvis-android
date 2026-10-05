@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
@@ -20,43 +20,154 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
       - name: Find Jarvis ZIP
+        shell: bash
         run: |
-          ZIP_FILE=$(find . -maxdepth 1 -type f -iname "jarvis*.zip" | head -n 1)
+          set -e
+
+          ZIP_FILE=$(find . -maxdepth 1 \
+            -type f \
+            -iname 'jarvis*.zip' \
+            -print | sort | head -n 1)
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: Jarvis ZIP not found!"
+            echo "ERROR: No jarvis*.zip found in repository root."
             exit 1
           fi
 
-          echo "Found: $ZIP_FILE"
+          echo "Using: $ZIP_FILE"
           echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
 
-      - name: Extract Jarvis project
+      - name: Extract Jarvis source
+        shell: bash
         run: |
+          set -e
+
           rm -rf project
           mkdir project
-          unzip -o "$ZIP_FILE" -d project
 
-          echo "Project files:"
-          find project -maxdepth 3 -type f | sort
+          unzip -q -o "$ZIP_FILE" -d project
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
+          echo "Jarvis source files:"
+          find project/app/src/main -type f | sort
 
-      - name: Build APK
-        working-directory: project
+      - name: Clone official llama.cpp Android project
+        shell: bash
         run: |
-          gradle assembleDebug --no-daemon
+          set -e
+
+          rm -rf /tmp/llama.cpp
+
+          git clone --depth 1 \
+            https://github.com/ggml-org/llama.cpp.git \
+            /tmp/llama.cpp
+
+          test -f /tmp/llama.cpp/examples/llama.android/gradlew
+          test -d /tmp/llama.cpp/examples/llama.android/lib
+
+      - name: Inject Jarvis app into official Android project
+        shell: bash
+        run: |
+          set -e
+
+          SRC="$GITHUB_WORKSPACE/project/app/src/main"
+          DST="/tmp/llama.cpp/examples/llama.android/app"
+
+          rm -rf \
+            "$DST/src/main/java" \
+            "$DST/src/main/res" \
+            "$DST/src/main/AndroidManifest.xml"
+
+          mkdir -p "$DST/src/main/java"
+          mkdir -p "$DST/src/main/res"
+
+          cp -R "$SRC/java" "$DST/src/main/"
+          cp -R "$SRC/res" "$DST/src/main/"
+          cp "$SRC/AndroidManifest.xml" \
+             "$DST/src/main/AndroidManifest.xml"
+
+          cat > "$DST/build.gradle.kts" <<'KTS'
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.jetbrains.kotlin.android)
+}
+
+android {
+    namespace = "com.jarvis.android"
+
+    compileSdk = 36
+
+    defaultConfig {
+        applicationId = "com.jarvis.android"
+
+        minSdk = 33
+        targetSdk = 36
+
+        versionCode = 3
+        versionName = "0.3.0"
+    }
+
+    buildTypes {
+        debug {
+            isMinifyEnabled = false
+        }
+
+        release {
+            isMinifyEnabled = false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    implementation(libs.bundles.androidx)
+    implementation(libs.material)
+
+    implementation(project(":lib"))
+}
+KTS
+
+          echo "Injected files:"
+          find "$DST/src/main" -type f | sort
+
+      - name: Build debug APK
+        working-directory: /tmp/llama.cpp/examples/llama.android
+        shell: bash
+        run: |
+          set -e
+
+          chmod +x gradlew
+
+          ./gradlew :app:assembleDebug --no-daemon
 
       - name: Find APK
+        shell: bash
         run: |
-          find project -type f -name "*.apk" -print
+          set -e
+
+          find \
+            /tmp/llama.cpp/examples/llama.android/app/build/outputs/apk/debug \
+            -type f \
+            -name '*.apk' \
+            -print
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: jarvis-debug-apk
-          path: project/app/build/outputs/apk/debug/*.apk
+
+          path: >
+            /tmp/llama.cpp/examples/llama.android/app/build/outputs/apk/debug/*.apk
+
+          if-no-files-found: error
