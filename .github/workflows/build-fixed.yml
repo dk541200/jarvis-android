@@ -48,8 +48,8 @@ jobs:
 
           unzip -q -o "$ZIP_FILE" -d jarvis-source
 
-          echo "Jarvis source:"
-          find jarvis-source -maxdepth 7 -type f | sort | head -250
+          echo "Extracted source:"
+          find jarvis-source -maxdepth 8 -type f | sort | head -300
 
       - name: Locate Jarvis Android source
         shell: bash
@@ -72,8 +72,11 @@ jobs:
           echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
           echo "SRC_DIR=$SRC_DIR" >> "$GITHUB_ENV"
 
-          echo "Jarvis app:"
+          echo "Jarvis APP_DIR:"
           echo "$APP_DIR"
+
+          echo "Jarvis SRC_DIR:"
+          echo "$SRC_DIR"
 
       - name: Clone official llama.cpp Android project
         shell: bash
@@ -170,9 +173,6 @@ jobs:
           print("Jarvis package configured.")
           PY
 
-          echo "Final llama app build file:"
-          cat "$BUILD_FILE"
-
       - name: Add required Android dependencies
         shell: bash
         run: |
@@ -193,16 +193,19 @@ jobs:
               'implementation("com.google.android.material:material:1.13.0")'
           ]
 
-          if "dependencies {" in text:
-              additions = "\n".join(
-                  d for d in deps
-                  if d not in text
-              )
+          marker = "dependencies {"
+
+          if marker in text:
+              additions = []
+
+              for dep in deps:
+                  if dep not in text:
+                      additions.append("    " + dep)
 
               if additions:
                   text = text.replace(
-                      "dependencies {",
-                      "dependencies {\n    " + additions,
+                      marker,
+                      marker + "\n" + "\n".join(additions),
                       1
                   )
 
@@ -212,7 +215,36 @@ jobs:
           print("Android dependencies checked.")
           PY
 
-      - name: Build Jarvis
+      - name: Build Jarvis and show Kotlin errors
+        working-directory: /tmp/llama.cpp/examples/llama.android
+        shell: bash
+        run: |
+          set +e
+
+          chmod +x gradlew
+
+          ./gradlew :app:compileDebugKotlin \
+            --no-daemon \
+            --console=plain \
+            2>&1 | tee kotlin-build.log
+
+          STATUS=${PIPESTATUS[0]}
+
+          echo ""
+          echo "========================================"
+          echo "        KOTLIN COMPILER ERRORS"
+          echo "========================================"
+
+          grep -E \
+            '(^e: |error:|\.kt:[0-9]+:[0-9]+)' \
+            kotlin-build.log || true
+
+          echo "========================================"
+
+          exit $STATUS
+
+      - name: Build final APK
+        if: success()
         working-directory: /tmp/llama.cpp/examples/llama.android
         shell: bash
         run: |
@@ -220,9 +252,12 @@ jobs:
 
           chmod +x gradlew
 
-          ./gradlew :app:assembleDebug --no-daemon
+          ./gradlew :app:assembleDebug \
+            --no-daemon \
+            --console=plain
 
       - name: Find APK
+        if: success()
         shell: bash
         run: |
           set -e
@@ -238,12 +273,13 @@ jobs:
             exit 1
           fi
 
-          echo "APK:"
+          echo "APK found:"
           echo "$APK"
 
           echo "APK_PATH=$APK" >> "$GITHUB_ENV"
 
       - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: jarvis-apk
