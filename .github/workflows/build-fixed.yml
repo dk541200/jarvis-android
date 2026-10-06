@@ -3,7 +3,8 @@ name: Build Jarvis APK
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
 
 jobs:
   build:
@@ -17,95 +18,148 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Find ZIP
+      - name: Find Jarvis ZIP
         shell: bash
         run: |
           set -e
 
-          ZIP=$(find . -maxdepth 1 -type f -name "*.zip" | head -n 1)
+          ZIP_FILE="$(find . -maxdepth 1 -type f -iname 'Jarvis*.zip' -print | head -n 1)"
 
-          if [ -z "$ZIP" ]; then
-            echo "ERROR: No ZIP file found."
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: Jarvis ZIP not found."
             exit 1
           fi
 
-          echo "Using ZIP: $ZIP"
-          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          echo "Using: $ZIP_FILE"
+          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
 
-      - name: Extract ZIP
+      - name: Extract Jarvis source
         shell: bash
         run: |
           set -e
 
-          rm -rf project
-          mkdir -p project
+          rm -rf jarvis-source
+          mkdir -p jarvis-source
 
-          unzip -q -o "$ZIP" -d project
+          unzip -q -o "$ZIP_FILE" -d jarvis-source
 
-          echo "Extracted project:"
-          find project -maxdepth 5 -type f | head -150
+          echo "Jarvis source:"
+          find jarvis-source -maxdepth 7 -type f | sort | head -250
 
-      - name: Find Gradle project
+      - name: Locate Jarvis Android source
         shell: bash
         run: |
           set -e
 
-          SETTINGS=$(find project \
+          MANIFEST="$(find jarvis-source \
             -type f \
-            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
-            -print -quit)
+            -path '*/app/src/main/AndroidManifest.xml' \
+            -print -quit)"
 
-          if [ -z "$SETTINGS" ]; then
-            echo "ERROR: No Gradle settings file found."
+          if [ -z "$MANIFEST" ]; then
+            echo "ERROR: AndroidManifest.xml not found."
             exit 1
           fi
 
-          PROJECT_DIR=$(dirname "$SETTINGS")
+          APP_DIR="${MANIFEST%/src/main/AndroidManifest.xml}"
+          SRC_DIR="$APP_DIR/src/main"
 
-          echo "Gradle project found at:"
-          echo "$PROJECT_DIR"
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          echo "SRC_DIR=$SRC_DIR" >> "$GITHUB_ENV"
 
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Jarvis app:"
+          echo "$APP_DIR"
 
-      - name: Fix Kotlin compiler configuration
+      - name: Clone official llama.cpp Android project
         shell: bash
         run: |
           set -e
 
-          BUILD_FILE="$PROJECT_DIR/app/build.gradle.kts"
+          rm -rf /tmp/llama.cpp
 
-          if [ ! -f "$BUILD_FILE" ]; then
-            echo "ERROR: $BUILD_FILE not found."
-            exit 1
+          git clone --depth 1 \
+            https://github.com/ggml-org/llama.cpp.git \
+            /tmp/llama.cpp
+
+          test -f /tmp/llama.cpp/examples/llama.android/gradlew
+          test -d /tmp/llama.cpp/examples/llama.android/lib
+
+          echo "Official llama.cpp Android project found."
+
+      - name: Inject Jarvis into llama.cpp Android project
+        shell: bash
+        run: |
+          set -e
+
+          SRC="$GITHUB_WORKSPACE/$SRC_DIR"
+          DEST="/tmp/llama.cpp/examples/llama.android/app"
+
+          rm -rf "$DEST/src/main/java"
+          rm -rf "$DEST/src/main/kotlin"
+          rm -rf "$DEST/src/main/res"
+          rm -rf "$DEST/src/main/assets"
+          rm -rf "$DEST/src/main/jniLibs"
+
+          mkdir -p "$DEST/src/main/java"
+          mkdir -p "$DEST/src/main/res"
+
+          if [ -d "$SRC/java" ]; then
+            cp -R "$SRC/java/." "$DEST/src/main/java/"
           fi
 
-          echo "Original build.gradle.kts:"
-          cat "$BUILD_FILE"
+          if [ -d "$SRC/kotlin" ]; then
+            cp -R "$SRC/kotlin/." "$DEST/src/main/java/"
+          fi
+
+          if [ -d "$SRC/res" ]; then
+            cp -R "$SRC/res/." "$DEST/src/main/res/"
+          fi
+
+          if [ -d "$SRC/assets" ]; then
+            mkdir -p "$DEST/src/main/assets"
+            cp -R "$SRC/assets/." "$DEST/src/main/assets/"
+          fi
+
+          if [ -d "$SRC/jniLibs" ]; then
+            mkdir -p "$DEST/src/main/jniLibs"
+            cp -R "$SRC/jniLibs/." "$DEST/src/main/jniLibs/"
+          fi
+
+          cp "$SRC/AndroidManifest.xml" \
+            "$DEST/src/main/AndroidManifest.xml"
+
+          echo "Jarvis source injected."
+
+      - name: Configure Jarvis application
+        shell: bash
+        run: |
+          set -e
+
+          BUILD_FILE="/tmp/llama.cpp/examples/llama.android/app/build.gradle.kts"
 
           python3 <<'PY'
-          import os
           import re
 
-          project_dir = os.environ["PROJECT_DIR"]
-          path = os.path.join(project_dir, "app", "build.gradle.kts")
+          path = "/tmp/llama.cpp/examples/llama.android/app/build.gradle.kts"
 
           with open(path, "r", encoding="utf-8") as f:
               text = f.read()
 
-          # Replace old Kotlin JVM target DSL.
           text = re.sub(
-              r'kotlinOptions\s*\{\s*jvmTarget\s*=\s*["\']17["\']\s*\}',
-              '''kotlin {
-              compilerOptions {
-                  jvmTarget.set(
-                      org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
-                  )
-              }''',
+              r'namespace\s*=\s*"[^"]+"',
+              'namespace = "com.jarvis.android"',
+              text,
+              count=1
+          )
+
+          text = re.sub(
+              r'applicationId\s*=\s*"[^"]+"',
+              'applicationId = "com.jarvis.android"',
               text,
               count=1
           )
@@ -113,45 +167,78 @@ jobs:
           with open(path, "w", encoding="utf-8") as f:
               f.write(text)
 
-          print("Kotlin compiler configuration patched.")
+          print("Jarvis package configured.")
           PY
 
-          echo "Patched build.gradle.kts:"
+          echo "Final llama app build file:"
           cat "$BUILD_FILE"
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.13'
-
-      - name: Build APK
+      - name: Add required Android dependencies
         shell: bash
         run: |
           set -e
 
-          cd "$PROJECT_DIR"
+          BUILD_FILE="/tmp/llama.cpp/examples/llama.android/app/build.gradle.kts"
 
-          echo "Building from:"
-          pwd
+          python3 <<'PY'
+          path = "/tmp/llama.cpp/examples/llama.android/app/build.gradle.kts"
 
-          gradle :app:assembleDebug --no-daemon
+          with open(path, "r", encoding="utf-8") as f:
+              text = f.read()
+
+          deps = [
+              'implementation("androidx.core:core-ktx:1.17.0")',
+              'implementation("androidx.activity:activity-ktx:1.12.2")',
+              'implementation("androidx.appcompat:appcompat:1.7.1")',
+              'implementation("com.google.android.material:material:1.13.0")'
+          ]
+
+          if "dependencies {" in text:
+              additions = "\n".join(
+                  d for d in deps
+                  if d not in text
+              )
+
+              if additions:
+                  text = text.replace(
+                      "dependencies {",
+                      "dependencies {\n    " + additions,
+                      1
+                  )
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(text)
+
+          print("Android dependencies checked.")
+          PY
+
+      - name: Build Jarvis
+        working-directory: /tmp/llama.cpp/examples/llama.android
+        shell: bash
+        run: |
+          set -e
+
+          chmod +x gradlew
+
+          ./gradlew :app:assembleDebug --no-daemon
 
       - name: Find APK
         shell: bash
         run: |
           set -e
 
-          APK=$(find "$PROJECT_DIR" \
+          APK="$(find \
+            /tmp/llama.cpp/examples/llama.android/app/build/outputs/apk/debug \
             -type f \
-            -path "*/app/build/outputs/apk/debug/*.apk" \
-            -print -quit)
+            -name '*.apk' \
+            -print -quit)"
 
           if [ -z "$APK" ]; then
-            echo "ERROR: APK was not generated."
+            echo "ERROR: APK not generated."
             exit 1
           fi
 
-          echo "APK found:"
+          echo "APK:"
           echo "$APK"
 
           echo "APK_PATH=$APK" >> "$GITHUB_ENV"
