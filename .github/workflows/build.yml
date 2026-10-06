@@ -21,28 +21,19 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Locate Android SDK
+      - name: Setup Android SDK
         shell: bash
         run: |
           set -e
-          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -n 1)
 
-          if [ -z "$SDKMANAGER" ]; then
-            echo "ERROR: sdkmanager not found"
-            exit 1
-          fi
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f -name sdkmanager | head -n 1)
+
+          test -n "$SDKMANAGER"
 
           echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
 
-      - name: Accept Android SDK licenses
-        shell: bash
-        run: |
           yes | "$SDKMANAGER" --licenses || true
-
-      - name: Install Android SDK packages
-        shell: bash
-        run: |
-          set -e
 
           "$SDKMANAGER" \
             "platform-tools" \
@@ -63,6 +54,17 @@ jobs:
             https://github.com/ggml-org/llama.cpp.git \
             /tmp/llama.cpp
 
+      - name: Verify official Android project
+        shell: bash
+        run: |
+          set -e
+
+          test -f /tmp/llama.cpp/examples/llama.android/app/build.gradle.kts
+          test -d /tmp/llama.cpp/examples/llama.android/lib
+          test -f /tmp/llama.cpp/examples/llama.android/lib/build.gradle.kts
+
+          echo "Official llama.cpp Android project verified."
+
       - name: Extract Jarvis source
         shell: bash
         run: |
@@ -73,68 +75,48 @@ jobs:
           rm -rf "$TEMP"
           mkdir -p "$TEMP"
 
-          if [ ! -f "jarvis-github-final.zip" ]; then
-            echo "ERROR: jarvis-github-final.zip not found"
-            exit 1
-          fi
+          test -f jarvis-github-final.zip
 
-          unzip -q "jarvis-github-final.zip" -d "$TEMP"
+          unzip -q jarvis-github-final.zip -d "$TEMP"
 
           if [ -f "$TEMP/JarvisSource.zip" ]; then
             mkdir -p "$TEMP/jarvis_content"
             unzip -q "$TEMP/JarvisSource.zip" -d "$TEMP/jarvis_content"
           fi
 
-          JARVIS_APP_DIR=$(find "$TEMP" \
+          JARVIS_MAIN=$(find "$TEMP" \
             -type d \
             -path "*/app/src/main" \
             | head -n 1)
 
-          if [ -z "$JARVIS_APP_DIR" ]; then
-            echo "ERROR: app/src/main not found"
-            find "$TEMP" -maxdepth 8 -print
-            exit 1
-          fi
+          test -n "$JARVIS_MAIN"
 
-          TARGET="/tmp/llama.cpp/examples/llama.android/app/src/main"
+          echo "JARVIS_MAIN=$JARVIS_MAIN" >> "$GITHUB_ENV"
+
+      - name: Install Jarvis app source
+        shell: bash
+        run: |
+          set -e
+
+          LLAMA_ANDROID="/tmp/llama.cpp/examples/llama.android"
+
+          TARGET="$LLAMA_ANDROID/app/src/main"
 
           rm -rf "$TARGET"
           mkdir -p "$TARGET"
 
-          cp -R "$JARVIS_APP_DIR"/. "$TARGET/"
+          cp -R "$JARVIS_MAIN"/. "$TARGET/"
 
-          # IMPORTANT:
-          # Only change Jarvis's old package.
-          # DO NOT change com.arm.aichat.
+          # Only Jarvis's application package is changed.
+          # com.arm.aichat MUST remain untouched.
           find "$TARGET" \
             -type f \
             \( -name "*.kt" -o -name "*.java" -o -name "*.xml" \) \
             -print0 |
           xargs -0 -r sed -i \
-            -e 's/com\.example\.llama\.aichat/com.jarvis.android/g'
+            's/com\.example\.llama\.aichat/com.jarvis.android/g'
 
-          mkdir -p "$TARGET/java/com/jarvis/android"
-
-          find "$TARGET" \
-            -type f \
-            \( -name "MainActivity.kt" -o -name "JarvisService.java" \) \
-            -print0 |
-          while IFS= read -r -d '' file; do
-
-            case "$file" in
-              "$TARGET/java/com/jarvis/android/"*)
-                ;;
-              *)
-                mv "$file" \
-                  "$TARGET/java/com/jarvis/android/$(basename "$file")"
-                ;;
-            esac
-
-          done
-
-          echo "Jarvis source prepared."
-
-      - name: Verify source
+      - name: Verify Jarvis source
         shell: bash
         run: |
           set -e
@@ -142,8 +124,12 @@ jobs:
           TARGET="/tmp/llama.cpp/examples/llama.android/app/src/main"
 
           test -f "$TARGET/AndroidManifest.xml"
-          test -f "$TARGET/java/com/jarvis/android/MainActivity.kt"
-          test -f "$TARGET/java/com/jarvis/android/JarvisService.java"
+
+          test -f \
+            "$TARGET/java/com/jarvis/android/MainActivity.kt"
+
+          test -f \
+            "$TARGET/java/com/jarvis/android/JarvisService.java"
 
           grep -q \
             '^package com.jarvis.android' \
@@ -153,19 +139,25 @@ jobs:
             '^package com.jarvis.android' \
             "$TARGET/java/com/jarvis/android/JarvisService.java"
 
-          if find "$TARGET" \
-            -type f \
-            \( -name "*.kt" -o -name "*.java" -o -name "*.xml" \) \
-            -exec grep -l "com.example.llama.aichat" {} \; |
-            grep -q .; then
+          # The Arm AI library package must still exist.
+          if ! grep -R \
+            -q "com.arm.aichat" \
+            "$TARGET"; then
 
-            echo "ERROR: Old package still exists"
+            echo "WARNING: Jarvis source does not reference com.arm.aichat."
+          fi
+
+          if grep -R \
+            -q "com.example.llama.aichat" \
+            "$TARGET"; then
+
+            echo "ERROR: Old package still exists."
             exit 1
           fi
 
-          echo "Source verification passed."
+          echo "Jarvis source verification passed."
 
-      - name: Configure Gradle
+      - name: Configure official Android project
         working-directory: /tmp/llama.cpp/examples/llama.android
         shell: bash
         run: |
@@ -176,10 +168,6 @@ jobs:
           import re
 
           p = Path("app/build.gradle.kts")
-
-          if not p.exists():
-              raise SystemExit("ERROR: app/build.gradle.kts not found")
-
           s = p.read_text()
 
           s = re.sub(
@@ -194,24 +182,16 @@ jobs:
               s
           )
 
-          if 'namespace = "com.jarvis.android"' not in s:
-              s = s.replace(
-                  "android {",
-                  'android {\n    namespace = "com.jarvis.android"',
-                  1
-              )
-
-          if 'applicationId = "com.jarvis.android"' not in s:
-              s = s.replace(
-                  "defaultConfig {",
-                  'defaultConfig {\n        applicationId = "com.jarvis.android"',
-                  1
-              )
-
-          # NEVER replace com.arm.aichat.
           s = s.replace(
-              "com.example.llama.aichat",
-              "com.jarvis.android"
+              "android {",
+              'android {\n    namespace = "com.jarvis.android"',
+              1
+          )
+
+          s = s.replace(
+              "defaultConfig {",
+              'defaultConfig {\n        applicationId = "com.jarvis.android"',
+              1
           )
 
           p.write_text(s)
@@ -225,7 +205,12 @@ jobs:
             'applicationId = "com.jarvis.android"' \
             app/build.gradle.kts
 
-      - name: Build Jarvis APK
+          # IMPORTANT:
+          # Do NOT modify the lib module's com.arm.aichat package.
+
+          echo "Gradle configuration verified."
+
+      - name: Build APK
         working-directory: /tmp/llama.cpp/examples/llama.android
         shell: bash
         run: |
@@ -238,19 +223,19 @@ jobs:
             --stacktrace \
             --info \
             --no-daemon \
-            2>&1 | tee /tmp/gradle-build.log
+            2>&1 | tee /tmp/jarvis-build.log
 
-      - name: Show Kotlin error
+      - name: Show useful error
         if: failure()
         shell: bash
         run: |
-          echo "========== ACTUAL BUILD ERROR =========="
+          echo "========== JARVIS BUILD ERROR =========="
 
-          if [ -f /tmp/gradle-build.log ]; then
+          if [ -f /tmp/jarvis-build.log ]; then
             grep -n -E \
-              "e: |error:|Unresolved reference|Execution failed for task|FAILURE:" \
-              /tmp/gradle-build.log |
-              tail -n 100 || true
+              "e: |error:|Unresolved reference|FAILURE:|Execution failed for task" \
+              /tmp/jarvis-build.log \
+              | tail -n 150 || true
           fi
 
       - name: Find APK
@@ -265,14 +250,11 @@ jobs:
             -name "*.apk" \
             | head -n 1)
 
-          if [ -z "$APK_FILE" ]; then
-            echo "ERROR: APK not found"
-            exit 1
-          fi
+          test -n "$APK_FILE"
 
           echo "APK_PATH=$APK_FILE" >> "$GITHUB_ENV"
 
-          echo "APK found:"
+          echo "APK:"
           echo "$APK_FILE"
 
       - name: Verify APK package
@@ -282,29 +264,22 @@ jobs:
 
           AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt"
 
-          PACKAGE_INFO=$(
+          INFO=$(
             "$AAPT" dump badging "$APK_PATH" |
             grep '^package:'
           )
 
-          echo "$PACKAGE_INFO"
+          echo "$INFO"
 
-          if ! echo "$PACKAGE_INFO" |
-            grep -q "name='com.jarvis.android'"; then
+          echo "$INFO" |
+            grep -q "name='com.jarvis.android'"
 
-            echo "ERROR: Wrong APK package"
+          echo "APK PACKAGE VERIFIED."
 
-            exit 1
-          fi
-
-          echo "APK PACKAGE VERIFIED"
-          echo "com.jarvis.android"
-
-      - name: Publish APK Release
+      - name: Publish GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-
         run: |
           set -e
 
@@ -315,8 +290,8 @@ jobs:
             "$APK_PATH" \
             --repo "${{ github.repository }}" \
             --title "Jarvis APK Build #${{ github.run_number }}" \
-            --notes "Jarvis Local AI APK. Package ID: com.jarvis.android."
+            --notes "Jarvis Local AI APK. Package: com.jarvis.android"
 
-          echo "================================"
+          echo "======================================"
           echo "JARVIS APK RELEASE CREATED"
-          echo "================================"
+          echo "======================================"
