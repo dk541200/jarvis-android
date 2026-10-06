@@ -26,9 +26,6 @@ jobs:
         run: |
           set -e
 
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
-
           SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
             -type f \
             -name sdkmanager \
@@ -71,17 +68,90 @@ jobs:
             https://github.com/ggml-org/llama.cpp.git \
             /tmp/llama.cpp
 
-      - name: Inject Jarvis source
+      - name: Extract and locate Jarvis source
         shell: bash
         run: |
           set -e
+
+          echo "===== REPOSITORY FILES ====="
+          ls -la
+
+          TEMP_EXTRACT="/tmp/jarvis_extract"
+          rm -rf "$TEMP_EXTRACT"
+          mkdir -p "$TEMP_EXTRACT"
+
+          if [ ! -f "jarvis-github-final.zip" ]; then
+            echo "ERROR: jarvis-github-final.zip not found"
+            exit 1
+          fi
+
+          echo "Extracting jarvis-github-final.zip..."
+          unzip -q "jarvis-github-final.zip" -d "$TEMP_EXTRACT"
+
+          echo "===== EXTRACTING JARVIS SOURCE ====="
+
+          if [ -f "$TEMP_EXTRACT/JarvisSource.zip" ]; then
+            echo "Found JarvisSource.zip"
+            unzip -q \
+              "$TEMP_EXTRACT/JarvisSource.zip" \
+              -d "$TEMP_EXTRACT/jarvis_content"
+          fi
+
+          JARVIS_APP_DIR=$(find "$TEMP_EXTRACT" \
+            -type d \
+            -path "*/app/src/main" \
+            | head -n 1)
+
+          if [ -z "$JARVIS_APP_DIR" ]; then
+            echo "ERROR: Could not locate app/src/main"
+            find "$TEMP_EXTRACT" -maxdepth 7 -print
+            exit 1
+          fi
+
+          echo "===== JARVIS SOURCE FOUND ====="
+          echo "JARVIS_APP_DIR=$JARVIS_APP_DIR"
+
+          REQUIRED_FILES=(
+            "AndroidManifest.xml"
+            "java/com/jarvis/android/MainActivity.kt"
+            "java/com/jarvis/android/JarvisService.java"
+          )
+
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ ! -f "$JARVIS_APP_DIR/$file" ]; then
+              echo "ERROR: Required file missing: $file"
+              exit 1
+            fi
+
+            echo "OK: $file"
+          done
 
           TARGET="/tmp/llama.cpp/examples/llama.android/app/src/main"
 
           rm -rf "$TARGET"
           mkdir -p "$TARGET"
 
-          cp -R app/src/main/. "$TARGET/"
+          cp -R "$JARVIS_APP_DIR"/. "$TARGET/"
+
+          echo "Jarvis source injected successfully."
+
+      - name: Verify Jarvis source
+        shell: bash
+        run: |
+          set -e
+
+          TARGET="/tmp/llama.cpp/examples/llama.android/app/src/main"
+
+          echo "===== FINAL SOURCE FILES ====="
+          find "$TARGET" -type f | sort
+
+          grep -q "package com.jarvis.android" \
+            "$TARGET/java/com/jarvis/android/MainActivity.kt"
+
+          grep -q "package com.jarvis.android" \
+            "$TARGET/java/com/jarvis/android/JarvisService.java"
+
+          echo "Jarvis package verification passed."
 
       - name: Configure Jarvis package
         working-directory: /tmp/llama.cpp/examples/llama.android
@@ -125,30 +195,9 @@ jobs:
 
           p.write_text(s)
 
-          print("Jarvis package configured successfully.")
+          print("namespace = com.jarvis.android")
+          print("applicationId = com.jarvis.android")
           PY
-
-      - name: Verify Jarvis source
-        shell: bash
-        run: |
-          set -e
-
-          echo "===== Jarvis source files ====="
-
-          find /tmp/llama.cpp/examples/llama.android/app/src/main \
-            -type f \
-            -print
-
-          echo ""
-          echo "===== Checking forbidden old setup action ====="
-
-          if grep -R "android-actions/setup-android" \
-            .github/workflows 2>/dev/null; then
-            echo "ERROR: Old setup-android action found in repository."
-            exit 1
-          fi
-
-          echo "No old setup-android action found."
 
       - name: Build Jarvis APK
         working-directory: /tmp/llama.cpp/examples/llama.android
@@ -168,12 +217,22 @@ jobs:
         run: |
           set -e
 
-          echo "===== APK FILES ====="
+          APK_DIR="/tmp/llama.cpp/examples/llama.android/app/build/outputs/apk/debug"
 
-          find /tmp/llama.cpp/examples/llama.android/app/build \
-            -type f \
-            -name "*.apk" \
-            -print
+          if [ ! -d "$APK_DIR" ]; then
+            echo "ERROR: APK output directory not found"
+            exit 1
+          fi
+
+          APK_FILES=$(find "$APK_DIR" -type f -name "*.apk")
+
+          if [ -z "$APK_FILES" ]; then
+            echo "ERROR: No APK found"
+            exit 1
+          fi
+
+          echo "===== APK FILES ====="
+          echo "$APK_FILES"
 
       - name: Upload Jarvis APK
         uses: actions/upload-artifact@v4
