@@ -2,9 +2,6 @@ name: Build and Release Jarvis APK
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 permissions:
   contents: write
@@ -41,9 +38,7 @@ jobs:
           fi
 
           echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
-
-          echo "AAPT=$ANDROID_HOME/build-tools/36.0.0/aapt" \
-            >> "$GITHUB_ENV"
+          echo "AAPT=$ANDROID_HOME/build-tools/36.0.0/aapt" >> "$GITHUB_ENV"
 
       - name: Accept Android SDK licenses
         shell: bash
@@ -74,7 +69,7 @@ jobs:
 
           echo "Official llama.cpp Android project verified."
 
-      - name: Read official native versions
+      - name: Read native tool versions
         shell: bash
         run: |
           set -euo pipefail
@@ -95,15 +90,8 @@ jobs:
               | head -n 1
           )"
 
-          if [ -z "$NDK_VERSION" ]; then
-            echo "ERROR: NDK version not found"
-            exit 1
-          fi
-
-          if [ -z "$CMAKE_VERSION" ]; then
-            echo "ERROR: CMake version not found"
-            exit 1
-          fi
+          test -n "$NDK_VERSION"
+          test -n "$CMAKE_VERSION"
 
           echo "NDK_VERSION=$NDK_VERSION" >> "$GITHUB_ENV"
           echo "CMAKE_VERSION=$CMAKE_VERSION" >> "$GITHUB_ENV"
@@ -123,143 +111,59 @@ jobs:
             "cmake;$CMAKE_VERSION" \
             "ndk;$NDK_VERSION"
 
-      - name: Locate Jarvis source
+      - name: Extract Jarvis source
         shell: bash
         run: |
           set -euo pipefail
 
-          WORKSPACE="$GITHUB_WORKSPACE"
           TEMP="/tmp/jarvis_extract"
 
           rm -rf "$TEMP"
           mkdir -p "$TEMP"
 
-          JARVIS_MAIN=""
+          test -f "$GITHUB_WORKSPACE/jarvis-github-final.zip"
 
-          echo "======================================"
-          echo "SEARCHING FOR JARVIS SOURCE"
-          echo "======================================"
+          echo "Testing Jarvis ZIP..."
 
-          # Direct repository source
-          if [ -d "$WORKSPACE/app/src/main" ]; then
-            echo "Direct app/src/main found."
-            JARVIS_MAIN="$WORKSPACE/app/src/main"
-          fi
+          unzip -t \
+            "$GITHUB_WORKSPACE/jarvis-github-final.zip"
 
-          # ZIP source
-          if [ -z "$JARVIS_MAIN" ]; then
+          echo "Extracting Jarvis ZIP..."
 
-            if [ -f "$WORKSPACE/jarvis-github-final.zip" ]; then
+          unzip -q \
+            "$GITHUB_WORKSPACE/jarvis-github-final.zip" \
+            -d "$TEMP"
 
-              echo "jarvis-github-final.zip found."
+          echo "Extracted structure:"
 
-              unzip -t \
-                "$WORKSPACE/jarvis-github-final.zip"
+          find "$TEMP" \
+            -maxdepth 10 \
+            -print \
+            | sort \
+            | head -500
 
-              unzip -q \
-                "$WORKSPACE/jarvis-github-final.zip" \
-                -d "$TEMP"
-
-              echo "ZIP extracted."
-
-              # Direct app/src/main
-              JARVIS_MAIN="$(
-                find "$TEMP" \
-                  -type d \
-                  -path "*/app/src/main" \
-                  | head -n 1 \
-                  || true
-              )"
-
-              # Nested JarvisSource.zip
-              if [ -z "$JARVIS_MAIN" ]; then
-
-                NESTED="$(
-                  find "$TEMP" \
-                    -type f \
-                    -name "JarvisSource.zip" \
-                    | head -n 1 \
-                    || true
-                )"
-
-                if [ -n "$NESTED" ]; then
-
-                  echo "Nested JarvisSource.zip found:"
-                  echo "$NESTED"
-
-                  NESTED_DIR="$TEMP/nested"
-
-                  rm -rf "$NESTED_DIR"
-                  mkdir -p "$NESTED_DIR"
-
-                  unzip -t "$NESTED"
-
-                  unzip -q \
-                    "$NESTED" \
-                    -d "$NESTED_DIR"
-
-                  JARVIS_MAIN="$(
-                    find "$NESTED_DIR" \
-                      -type d \
-                      -path "*/app/src/main" \
-                      | head -n 1 \
-                      || true
-                  )"
-
-                fi
-
-              fi
-
-            else
-              echo "ERROR: jarvis-github-final.zip not found."
-            fi
-
-          fi
-
-          # Final validation
-          if [ -z "$JARVIS_MAIN" ]; then
-
-            echo ""
-            echo "======================================"
-            echo "ERROR: JARVIS SOURCE NOT FOUND"
-            echo "======================================"
-
-            echo ""
-            echo "Repository structure:"
-
-            find "$WORKSPACE" \
-              -maxdepth 6 \
-              -print \
-              | sort \
-              | head -400 || true
-
-            echo ""
-            echo "Extracted structure:"
-
+          JARVIS_MAIN="$(
             find "$TEMP" \
-              -maxdepth 8 \
-              -print \
-              | sort \
-              | head -400 || true
+              -type d \
+              -path "*/app/src/main" \
+              | head -n 1 \
+              || true
+          )"
 
+          if [ -z "$JARVIS_MAIN" ]; then
+            echo "ERROR: app/src/main not found inside Jarvis ZIP."
             exit 1
           fi
 
-          echo ""
-          echo "======================================"
-          echo "JARVIS SOURCE FOUND"
-          echo "======================================"
-
-          echo "$JARVIS_MAIN"
-
           echo "JARVIS_MAIN=$JARVIS_MAIN" >> "$GITHUB_ENV"
+
+          echo "Jarvis source found:"
+          echo "$JARVIS_MAIN"
 
       - name: Verify Jarvis source
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "Checking Jarvis source..."
 
           test -f "$JARVIS_MAIN/AndroidManifest.xml"
 
@@ -335,6 +239,9 @@ jobs:
             'import com.arm.aichat' \
             "$TARGET/java/com/jarvis/android/MainActivity.kt"
 
+          test -d \
+            "/tmp/llama.cpp/examples/llama.android/lib/src/main/java/com/arm/aichat"
+
           if grep -R -q \
             'com.example.llama.aichat' \
             "$TARGET"; then
@@ -342,9 +249,6 @@ jobs:
             echo "ERROR: Old package remains."
             exit 1
           fi
-
-          test -d \
-            "/tmp/llama.cpp/examples/llama.android/lib/src/main/java/com/arm/aichat"
 
           echo "Installed source verification PASSED."
 
@@ -392,7 +296,7 @@ jobs:
 
           echo "Application ID configured."
 
-      - name: Verify Arm library
+      - name: Verify Arm AI library
         shell: bash
         run: |
           set -euo pipefail
@@ -405,7 +309,7 @@ jobs:
             'package com.arm.aichat' \
             "$ARM"
 
-          echo "Arm AI library boundary PASSED."
+          echo "Arm AI library verified."
 
       - name: Build Jarvis APK
         working-directory: /tmp/llama.cpp/examples/llama.android
@@ -457,13 +361,6 @@ jobs:
 
           if [ -z "$APK" ]; then
             echo "ERROR: APK not found."
-
-            find \
-              "/tmp/llama.cpp/examples/llama.android/app/build/outputs" \
-              -type f \
-              | head -100 \
-              || true
-
             exit 1
           fi
 
@@ -502,9 +399,6 @@ jobs:
 
           cp \
             "$APK_SOURCE" \
-            "$GITHUB_WORKSPACE/release/Jarvis-Local-AI.apk"
-
-          test -f \
             "$GITHUB_WORKSPACE/release/Jarvis-Local-AI.apk"
 
           echo \
