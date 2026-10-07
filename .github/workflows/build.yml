@@ -1,7 +1,9 @@
-name: Build and Release Jarvis APK
+name: Build Jarvis APK
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 
 permissions:
   contents: write
@@ -12,7 +14,6 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -22,18 +23,18 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Locate Android SDK tools
+      - name: Locate Android SDK
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
           SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-            -type f \
-            -name sdkmanager \
-            | head -n 1 || true)"
+            -type f -name sdkmanager | head -n 1)"
 
           if [ -z "$SDKMANAGER" ]; then
             echo "ERROR: sdkmanager not found"
+            find "$ANDROID_HOME/cmdline-tools" \
+              -maxdepth 3 -type f | head -50
             exit 1
           fi
 
@@ -43,384 +44,242 @@ jobs:
       - name: Accept Android SDK licenses
         shell: bash
         run: |
-          set -euo pipefail
-
-          yes | "$SDKMANAGER" --licenses \
-            >/dev/null 2>&1 || true
-
-      - name: Download official llama.cpp
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          rm -rf /tmp/llama.cpp
-
-          git clone \
-            --depth 1 \
-            --branch master \
-            https://github.com/ggml-org/llama.cpp.git \
-            /tmp/llama.cpp
-
-          PROJECT="/tmp/llama.cpp/examples/llama.android"
-
-          test -f "$PROJECT/gradlew"
-          test -f "$PROJECT/app/build.gradle.kts"
-          test -f "$PROJECT/lib/build.gradle.kts"
-
-          echo "Official llama.cpp Android project verified."
-
-      - name: Read native tool versions
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          FILE="/tmp/llama.cpp/examples/llama.android/lib/build.gradle.kts"
-
-          NDK_VERSION="$(
-            sed -n \
-              's/^[[:space:]]*ndkVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
-              "$FILE" \
-              | head -n 1
-          )"
-
-          CMAKE_VERSION="$(
-            sed -n \
-              's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
-              "$FILE" \
-              | head -n 1
-          )"
-
-          test -n "$NDK_VERSION"
-          test -n "$CMAKE_VERSION"
-
-          echo "NDK_VERSION=$NDK_VERSION" >> "$GITHUB_ENV"
-          echo "CMAKE_VERSION=$CMAKE_VERSION" >> "$GITHUB_ENV"
-
-          echo "NDK: $NDK_VERSION"
-          echo "CMake: $CMAKE_VERSION"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
 
       - name: Install Android SDK packages
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
           "$SDKMANAGER" \
             "platform-tools" \
             "platforms;android-36" \
             "build-tools;36.0.0" \
-            "cmake;$CMAKE_VERSION" \
-            "ndk;$NDK_VERSION"
+            "cmake;3.31.6" \
+            "ndk;29.0.13113456"
 
-      - name: Extract Jarvis source
+      - name: Download official llama.cpp
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
-          TEMP="/tmp/jarvis_extract"
+          rm -rf /tmp/llama.cpp
 
-          rm -rf "$TEMP"
-          mkdir -p "$TEMP"
+          git clone --depth 1 \
+            https://github.com/ggml-org/llama.cpp.git \
+            /tmp/llama.cpp
 
-          test -f "$GITHUB_WORKSPACE/jarvis-github-final.zip"
+          test -f /tmp/llama.cpp/examples/llama.android/gradlew
+          test -d /tmp/llama.cpp/examples/llama.android/lib
 
-          echo "Testing Jarvis ZIP..."
+      - name: Download bundled Jarvis GGUF model
+        shell: bash
+        run: |
+          set -e
 
-          unzip -t \
-            "$GITHUB_WORKSPACE/jarvis-github-final.zip"
+          MODEL_DIR="$GITHUB_WORKSPACE/app/src/main/assets"
+          MODEL="$MODEL_DIR/Llama-3.2-1B-Instruct-Q4_0.gguf"
 
-          echo "Extracting Jarvis ZIP..."
+          mkdir -p "$MODEL_DIR"
 
-          unzip -q \
-            "$GITHUB_WORKSPACE/jarvis-github-final.zip" \
-            -d "$TEMP"
+          echo "Downloading bundled Llama 3.2 1B Q4_0 model..."
 
-          echo "Extracted structure:"
+          curl -L \
+            --fail \
+            --retry 3 \
+            --retry-delay 5 \
+            -o "$MODEL" \
+            "https://huggingface.co/gaianet/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf"
 
-          find "$TEMP" \
-            -maxdepth 10 \
-            -print \
-            | sort \
-            | head -500
+          test -f "$MODEL"
 
-          JARVIS_MAIN="$(
-            find "$TEMP" \
-              -type d \
-              -path "*/app/src/main" \
-              | head -n 1 \
-              || true
-          )"
+          SIZE=$(stat -c%s "$MODEL")
 
-          if [ -z "$JARVIS_MAIN" ]; then
-            echo "ERROR: app/src/main not found inside Jarvis ZIP."
+          echo "Model size: $SIZE bytes"
+
+          if [ "$SIZE" -lt 700000000 ]; then
+            echo "ERROR: GGUF model appears incomplete."
             exit 1
           fi
 
-          echo "JARVIS_MAIN=$JARVIS_MAIN" >> "$GITHUB_ENV"
+      - name: Inject Jarvis source
+        shell: bash
+        run: |
+          set -e
 
-          echo "Jarvis source found:"
-          echo "$JARVIS_MAIN"
+          SRC="$GITHUB_WORKSPACE/app/src/main"
+          DEST="/tmp/llama.cpp/examples/llama.android/app"
+
+          test -f "$SRC/AndroidManifest.xml"
+          test -f "$SRC/java/com/jarvis/android/MainActivity.kt"
+          test -f "$SRC/java/com/jarvis/android/JarvisService.java"
+
+          rm -rf \
+            "$DEST/src/main/java" \
+            "$DEST/src/main/kotlin" \
+            "$DEST/src/main/res" \
+            "$DEST/src/main/assets"
+
+          mkdir -p \
+            "$DEST/src/main/java" \
+            "$DEST/src/main/res" \
+            "$DEST/src/main/assets"
+
+          cp -R "$SRC/java/." "$DEST/src/main/java/"
+          cp -R "$SRC/res/." "$DEST/src/main/res/"
+          cp -R "$SRC/assets/." "$DEST/src/main/assets/"
+
+          cp \
+            "$SRC/AndroidManifest.xml" \
+            "$DEST/src/main/AndroidManifest.xml"
 
       - name: Verify Jarvis source
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
-          test -f "$JARVIS_MAIN/AndroidManifest.xml"
+          MAIN="/tmp/llama.cpp/examples/llama.android/app/src/main"
 
-          test -f \
-            "$JARVIS_MAIN/java/com/jarvis/android/MainActivity.kt"
+          echo "Checking Jarvis package..."
 
-          test -f \
-            "$JARVIS_MAIN/java/com/jarvis/android/JarvisService.java"
+          grep -R \
+            "package com.jarvis.android" \
+            "$MAIN/java/com/jarvis/android"
 
-          grep -q \
-            '^package com.jarvis.android' \
-            "$JARVIS_MAIN/java/com/jarvis/android/MainActivity.kt"
+          echo "Checking llama Android library imports..."
 
-          grep -q \
-            '^package com.jarvis.android' \
-            "$JARVIS_MAIN/java/com/jarvis/android/JarvisService.java"
+          grep -R \
+            "import com.arm.aichat" \
+            "$MAIN/java/com/jarvis/android" || true
 
-          grep -q \
-            'com.arm.aichat' \
-            "$JARVIS_MAIN/java/com/jarvis/android/MainActivity.kt"
+          if grep -R \
+            "com.example.llama.aichat" \
+            "$MAIN" >/dev/null 2>&1; then
 
-          if grep -R -q \
-            'com.example.llama.aichat' \
-            "$JARVIS_MAIN"; then
+            echo "ERROR: legacy package remains:"
+            grep -R -n \
+              "com.example.llama.aichat" \
+              "$MAIN"
 
-            echo "ERROR: Old package found."
             exit 1
           fi
 
-          echo "Jarvis source verification PASSED."
+          echo "Source verification passed."
 
-      - name: Install Jarvis source
+      - name: Configure application ID
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
-          LLAMA_ANDROID="/tmp/llama.cpp/examples/llama.android"
-          TARGET="$LLAMA_ANDROID/app/src/main"
-
-          rm -rf "$TARGET"
-          mkdir -p "$TARGET"
-
-          cp -R \
-            "$JARVIS_MAIN/." \
-            "$TARGET/"
-
-          echo "Jarvis source installed."
-
-      - name: Verify installed source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          TARGET="/tmp/llama.cpp/examples/llama.android/app/src/main"
-
-          test -f "$TARGET/AndroidManifest.xml"
-
-          test -f \
-            "$TARGET/java/com/jarvis/android/MainActivity.kt"
-
-          test -f \
-            "$TARGET/java/com/jarvis/android/JarvisService.java"
-
-          grep -q \
-            '^package com.jarvis.android' \
-            "$TARGET/java/com/jarvis/android/MainActivity.kt"
-
-          grep -q \
-            '^package com.jarvis.android' \
-            "$TARGET/java/com/jarvis/android/JarvisService.java"
-
-          grep -q \
-            'import com.arm.aichat' \
-            "$TARGET/java/com/jarvis/android/MainActivity.kt"
-
-          test -d \
-            "/tmp/llama.cpp/examples/llama.android/lib/src/main/java/com/arm/aichat"
-
-          if grep -R -q \
-            'com.example.llama.aichat' \
-            "$TARGET"; then
-
-            echo "ERROR: Old package remains."
-            exit 1
-          fi
-
-          echo "Installed source verification PASSED."
-
-      - name: Configure Jarvis application ID
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          FILE="/tmp/llama.cpp/examples/llama.android/app/build.gradle.kts"
+          GRADLE_FILE="/tmp/llama.cpp/examples/llama.android/app/build.gradle.kts"
 
           python3 - <<'PY'
-          from pathlib import Path
           import re
 
-          path = Path(
-              "/tmp/llama.cpp/examples/llama.android/app/build.gradle.kts"
-          )
+          path = "/tmp/llama.cpp/examples/llama.android/app/build.gradle.kts"
 
-          text = path.read_text(encoding="utf-8")
+          with open(path, "r", encoding="utf-8") as f:
+              text = f.read()
 
           text = re.sub(
-              r'(?m)^[ \t]*namespace[ \t]*=[ \t]*"[^"]*"[ \t]*$',
-              '    namespace = "com.jarvis.android"',
+              r'namespace\s*=\s*"[^"]+"',
+              'namespace = "com.jarvis.android"',
               text,
               count=1
           )
 
           text = re.sub(
-              r'(?m)^[ \t]*applicationId[ \t]*=[ \t]*"[^"]*"[ \t]*$',
-              '        applicationId = "com.jarvis.android"',
+              r'applicationId\s*=\s*"[^"]+"',
+              'applicationId = "com.jarvis.android"',
               text,
               count=1
           )
 
-          path.write_text(text, encoding="utf-8")
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(text)
           PY
 
-          grep -q \
-            'namespace = "com.jarvis.android"' \
-            "$FILE"
+          echo "Configured Gradle:"
+          grep -n \
+            -E "namespace|applicationId" \
+            "$GRADLE_FILE"
 
-          grep -q \
-            'applicationId = "com.jarvis.android"' \
-            "$FILE"
-
-          echo "Application ID configured."
-
-      - name: Verify Arm AI library
+      - name: Verify bundled model
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
-          ARM="/tmp/llama.cpp/examples/llama.android/lib/src/main/java/com/arm/aichat"
+          MODEL="/tmp/llama.cpp/examples/llama.android/app/src/main/assets/Llama-3.2-1B-Instruct-Q4_0.gguf"
 
-          test -d "$ARM"
+          test -f "$MODEL"
 
-          grep -R -q \
-            'package com.arm.aichat' \
-            "$ARM"
+          SIZE=$(stat -c%s "$MODEL")
 
-          echo "Arm AI library verified."
+          echo "Bundled model size: $SIZE bytes"
+
+          if [ "$SIZE" -lt 700000000 ]; then
+            echo "ERROR: Bundled GGUF is incomplete."
+            exit 1
+          fi
 
       - name: Build Jarvis APK
         working-directory: /tmp/llama.cpp/examples/llama.android
         shell: bash
         run: |
-          set -o pipefail
+          set -e
 
           chmod +x gradlew
 
-          ./gradlew \
-            :app:assembleDebug \
+          ./gradlew :app:assembleDebug \
             --stacktrace \
             --info \
             --console=plain \
-            --no-daemon \
-            2>&1 | tee /tmp/jarvis-build.log
+            --no-daemon
 
-      - name: Show useful build errors
-        if: failure()
+      - name: Verify APK
         shell: bash
         run: |
-          echo "======================================"
-          echo "JARVIS BUILD ERROR"
-          echo "======================================"
+          set -e
 
-          if [ -f /tmp/jarvis-build.log ]; then
-            grep -n -E \
-              'e: |error:|Unresolved reference|FAILURE:|Execution failed for task|BUILD FAILED' \
-              /tmp/jarvis-build.log \
-              | tail -n 250 \
-              || true
-          fi
+          APK="$(find \
+            /tmp/llama.cpp/examples/llama.android/app/build/outputs/apk/debug \
+            -maxdepth 1 \
+            -type f \
+            -name '*.apk' | head -n 1)"
 
-      - name: Find APK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          APK_DIR="/tmp/llama.cpp/examples/llama.android/app/build/outputs/apk/debug"
-
-          APK="$(
-            find "$APK_DIR" \
-              -maxdepth 1 \
-              -type f \
-              -name "*.apk" \
-              | head -n 1 \
-              || true
-          )"
-
-          if [ -z "$APK" ]; then
-            echo "ERROR: APK not found."
-            exit 1
-          fi
+          test -n "$APK"
+          test -f "$APK"
 
           echo "APK found:"
           echo "$APK"
 
-          echo "APK_SOURCE=$APK" >> "$GITHUB_ENV"
+          echo "Checking package ID..."
 
-      - name: Verify APK package
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          test -x "$AAPT"
-
-          INFO="$(
-            "$AAPT" \
-              dump badging \
-              "$APK_SOURCE" \
-              | grep '^package:'
-          )"
-
-          echo "$INFO"
-
-          echo "$INFO" \
+          "$AAPT" dump badging "$APK" \
             | grep -q "name='com.jarvis.android'"
 
-          echo "APK PACKAGE VERIFIED."
-
-      - name: Prepare release APK
-        shell: bash
-        run: |
-          set -euo pipefail
+          "$AAPT" dump badging "$APK" \
+            | grep "^package:"
 
           mkdir -p "$GITHUB_WORKSPACE/release"
 
           cp \
-            "$APK_SOURCE" \
+            "$APK" \
             "$GITHUB_WORKSPACE/release/Jarvis-Local-AI.apk"
 
-          echo \
-            "APK_PATH=$GITHUB_WORKSPACE/release/Jarvis-Local-AI.apk" \
-            >> "$GITHUB_ENV"
+          echo "APK verification passed."
 
       - name: Publish GitHub Release
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
           TAG="jarvis-build-${{ github.run_number }}-${{ github.run_attempt }}"
 
-          gh release create \
-            "$TAG" \
-            "$APK_PATH" \
+          gh release create "$TAG" \
+            "$GITHUB_WORKSPACE/release/Jarvis-Local-AI.apk" \
             --repo "${{ github.repository }}" \
             --title "Jarvis Local AI APK #${{ github.run_number }}" \
-            --notes "Jarvis Local AI APK. Package: com.jarvis.android."
-
-          echo "======================================"
-          echo "JARVIS APK RELEASE CREATED"
-          echo "======================================"
+            --notes "Jarvis Local AI APK. Package ID: com.jarvis.android."
