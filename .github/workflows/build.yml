@@ -1,4 +1,4 @@
-name: Build Jarvis APK
+name: Build Jarvis Local AI APK
 
 on:
   workflow_dispatch:
@@ -29,12 +29,16 @@ jobs:
           set -e
 
           SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-            -type f -name sdkmanager | head -n 1)"
+            -type f \
+            -name sdkmanager \
+            | head -n 1)"
 
           if [ -z "$SDKMANAGER" ]; then
             echo "ERROR: sdkmanager not found"
             find "$ANDROID_HOME/cmdline-tools" \
-              -maxdepth 3 -type f | head -50
+              -maxdepth 3 \
+              -type f \
+              | head -50
             exit 1
           fi
 
@@ -65,22 +69,26 @@ jobs:
 
           rm -rf /tmp/llama.cpp
 
-          git clone --depth 1 \
+          git clone \
+            --depth 1 \
             https://github.com/ggml-org/llama.cpp.git \
             /tmp/llama.cpp
 
-          test -f /tmp/llama.cpp/examples/llama.android/gradlew
-          test -d /tmp/llama.cpp/examples/llama.android/lib
+          test -f \
+            /tmp/llama.cpp/examples/llama.android/gradlew
+
+          test -d \
+            /tmp/llama.cpp/examples/llama.android/lib
+
+          echo "Official llama.cpp downloaded successfully."
 
       - name: Download bundled Jarvis GGUF model
         shell: bash
         run: |
           set -e
 
-          MODEL_DIR="$GITHUB_WORKSPACE/app/src/main/assets"
-          MODEL="$MODEL_DIR/Llama-3.2-1B-Instruct-Q4_0.gguf"
-
-          mkdir -p "$MODEL_DIR"
+          MODEL_NAME="Llama-3.2-1B-Instruct-Q4_0.gguf"
+          MODEL="/tmp/$MODEL_NAME"
 
           echo "Downloading bundled Llama 3.2 1B Q4_0 model..."
 
@@ -98,21 +106,90 @@ jobs:
           echo "Model size: $SIZE bytes"
 
           if [ "$SIZE" -lt 700000000 ]; then
-            echo "ERROR: GGUF model appears incomplete."
+            echo "ERROR: GGUF model download appears incomplete."
             exit 1
           fi
 
-      - name: Inject Jarvis source
+          echo "GGUF model download successful."
+
+      - name: Extract Jarvis source ZIP
         shell: bash
         run: |
           set -e
 
-          SRC="$GITHUB_WORKSPACE/app/src/main"
-          DEST="/tmp/llama.cpp/examples/llama.android/app"
+          ZIP="$GITHUB_WORKSPACE/jarvis-github-final.zip"
+          EXTRACT="/tmp/jarvis-source"
+
+          echo "Checking Jarvis source ZIP..."
+
+          test -f "$ZIP"
+
+          rm -rf "$EXTRACT"
+          mkdir -p "$EXTRACT"
+
+          unzip -q "$ZIP" -d "$EXTRACT"
+
+          echo "ZIP extracted."
+
+          echo "Searching for Jarvis MainActivity..."
+
+          MAIN_FILE="$(find "$EXTRACT" \
+            -type f \
+            -path "*/com/jarvis/android/MainActivity.kt" \
+            -print \
+            -quit)"
+
+          if [ -z "$MAIN_FILE" ]; then
+            echo "ERROR: MainActivity.kt not found."
+
+            echo "ZIP contents:"
+            find "$EXTRACT" \
+              -maxdepth 8 \
+              -type f \
+              | head -150
+
+            exit 1
+          fi
+
+          echo "MainActivity found:"
+          echo "$MAIN_FILE"
+
+          MAIN_DIR="$(dirname "$MAIN_FILE")"
+
+          SRC="$(dirname \
+            "$(dirname \
+              "$(dirname \
+                "$(dirname \
+                  "$(dirname "$MAIN_DIR")"
+                )"
+              )"
+            )"
+          )"
+
+          echo "Detected source directory:"
+          echo "$SRC"
 
           test -f "$SRC/AndroidManifest.xml"
           test -f "$SRC/java/com/jarvis/android/MainActivity.kt"
           test -f "$SRC/java/com/jarvis/android/JarvisService.java"
+
+          echo "Jarvis source structure verified."
+
+          echo "$SRC" > /tmp/jarvis-src-path.txt
+
+      - name: Inject Jarvis source into official llama.cpp
+        shell: bash
+        run: |
+          set -e
+
+          SRC="$(cat /tmp/jarvis-src-path.txt)"
+          DEST="/tmp/llama.cpp/examples/llama.android/app"
+
+          echo "Source:"
+          echo "$SRC"
+
+          echo "Destination:"
+          echo "$DEST"
 
           rm -rf \
             "$DEST/src/main/java" \
@@ -125,13 +202,56 @@ jobs:
             "$DEST/src/main/res" \
             "$DEST/src/main/assets"
 
-          cp -R "$SRC/java/." "$DEST/src/main/java/"
-          cp -R "$SRC/res/." "$DEST/src/main/res/"
-          cp -R "$SRC/assets/." "$DEST/src/main/assets/"
+          cp -R \
+            "$SRC/java/." \
+            "$DEST/src/main/java/"
+
+          if [ -d "$SRC/res" ]; then
+            cp -R \
+              "$SRC/res/." \
+              "$DEST/src/main/res/"
+          fi
+
+          if [ -d "$SRC/assets" ]; then
+            cp -R \
+              "$SRC/assets/." \
+              "$DEST/src/main/assets/"
+          fi
 
           cp \
             "$SRC/AndroidManifest.xml" \
             "$DEST/src/main/AndroidManifest.xml"
+
+          echo "Jarvis source injected successfully."
+
+      - name: Bundle Llama model into APK
+        shell: bash
+        run: |
+          set -e
+
+          DEST="/tmp/llama.cpp/examples/llama.android/app"
+          MODEL="/tmp/Llama-3.2-1B-Instruct-Q4_0.gguf"
+
+          mkdir -p "$DEST/src/main/assets"
+
+          cp \
+            "$MODEL" \
+            "$DEST/src/main/assets/Llama-3.2-1B-Instruct-Q4_0.gguf"
+
+          test -f \
+            "$DEST/src/main/assets/Llama-3.2-1B-Instruct-Q4_0.gguf"
+
+          SIZE=$(stat -c%s \
+            "$DEST/src/main/assets/Llama-3.2-1B-Instruct-Q4_0.gguf")
+
+          echo "Bundled model size: $SIZE bytes"
+
+          if [ "$SIZE" -lt 700000000 ]; then
+            echo "ERROR: Bundled model is incomplete."
+            exit 1
+          fi
+
+          echo "Model bundled successfully."
 
       - name: Verify Jarvis source
         shell: bash
@@ -146,17 +266,20 @@ jobs:
             "package com.jarvis.android" \
             "$MAIN/java/com/jarvis/android"
 
-          echo "Checking llama Android library imports..."
+          echo "Checking AI library imports..."
 
           grep -R \
             "import com.arm.aichat" \
-            "$MAIN/java/com/jarvis/android" || true
+            "$MAIN/java/com/jarvis/android"
+
+          echo "Checking legacy package..."
 
           if grep -R \
             "com.example.llama.aichat" \
             "$MAIN" >/dev/null 2>&1; then
 
-            echo "ERROR: legacy package remains:"
+            echo "ERROR: legacy package found."
+
             grep -R -n \
               "com.example.llama.aichat" \
               "$MAIN"
@@ -164,7 +287,23 @@ jobs:
             exit 1
           fi
 
-          echo "Source verification passed."
+          echo "Checking bundled model..."
+
+          test -f \
+            "$MAIN/assets/Llama-3.2-1B-Instruct-Q4_0.gguf"
+
+          echo "Checking Jarvis files..."
+
+          test -f \
+            "$MAIN/java/com/jarvis/android/MainActivity.kt"
+
+          test -f \
+            "$MAIN/java/com/jarvis/android/JarvisService.java"
+
+          test -f \
+            "$MAIN/AndroidManifest.xml"
+
+          echo "All Jarvis source checks passed."
 
       - name: Configure application ID
         shell: bash
@@ -199,12 +338,13 @@ jobs:
               f.write(text)
           PY
 
-          echo "Configured Gradle:"
+          echo "Final namespace/applicationId:"
+
           grep -n \
             -E "namespace|applicationId" \
             "$GRADLE_FILE"
 
-      - name: Verify bundled model
+      - name: Verify bundled model before build
         shell: bash
         run: |
           set -e
@@ -215,12 +355,14 @@ jobs:
 
           SIZE=$(stat -c%s "$MODEL")
 
-          echo "Bundled model size: $SIZE bytes"
+          echo "Final APK model size: $SIZE bytes"
 
           if [ "$SIZE" -lt 700000000 ]; then
-            echo "ERROR: Bundled GGUF is incomplete."
+            echo "ERROR: Model is too small."
             exit 1
           fi
+
+          echo "Final model verification passed."
 
       - name: Build Jarvis APK
         working-directory: /tmp/llama.cpp/examples/llama.android
@@ -245,9 +387,14 @@ jobs:
             /tmp/llama.cpp/examples/llama.android/app/build/outputs/apk/debug \
             -maxdepth 1 \
             -type f \
-            -name '*.apk' | head -n 1)"
+            -name '*.apk' \
+            | head -n 1)"
 
-          test -n "$APK"
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK was not generated."
+            exit 1
+          fi
+
           test -f "$APK"
 
           echo "APK found:"
@@ -261,7 +408,18 @@ jobs:
           "$AAPT" dump badging "$APK" \
             | grep "^package:"
 
-          mkdir -p "$GITHUB_WORKSPACE/release"
+          echo "Checking APK size..."
+
+          APK_SIZE=$(stat -c%s "$APK")
+
+          echo "APK size: $APK_SIZE bytes"
+
+          if [ "$APK_SIZE" -lt 500000000 ]; then
+            echo "WARNING: APK is unexpectedly small."
+          fi
+
+          mkdir -p \
+            "$GITHUB_WORKSPACE/release"
 
           cp \
             "$APK" \
@@ -278,8 +436,11 @@ jobs:
 
           TAG="jarvis-build-${{ github.run_number }}-${{ github.run_attempt }}"
 
-          gh release create "$TAG" \
+          gh release create \
+            "$TAG" \
             "$GITHUB_WORKSPACE/release/Jarvis-Local-AI.apk" \
             --repo "${{ github.repository }}" \
             --title "Jarvis Local AI APK #${{ github.run_number }}" \
-            --notes "Jarvis Local AI APK. Package ID: com.jarvis.android."
+            --notes "Jarvis Local AI APK with bundled Llama 3.2 1B Q4_0. Package ID: com.jarvis.android."
+
+          echo "GitHub Release created successfully."
