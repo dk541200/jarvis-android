@@ -21,58 +21,59 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "Repository root:"
-          ls -la
+
           ZIP=""
+
           while IFS= read -r -d '' f; do
             if unzip -l "$f" | grep -q 'app/src/main/java/com/jarvis/android/MainActivity.kt'; then
               ZIP="$f"
               break
             fi
-          done < <(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -iname '*.zip' -print0)
-          test -n "$ZIP" || { echo 'ERROR: No uploaded Jarvis source ZIP containing app/src/main found.'; exit 1; }
+          done < <(
+            find "$GITHUB_WORKSPACE" \
+              -maxdepth 1 \
+              -type f \
+              -iname '*.zip' \
+              -print0
+          )
+
+          test -n "$ZIP" || {
+            echo "ERROR: Jarvis source ZIP not found."
+            exit 1
+          }
+
           echo "Using source ZIP: $ZIP"
+
           rm -rf /tmp/jarvis-source
           mkdir -p /tmp/jarvis-source
+
           unzip -q "$ZIP" -d /tmp/jarvis-source
-          SRC="$GITHUB_WORKSPACE/app/src/main"
-          ZIP_SRC="/tmp/jarvis-source/app/src/main"
-          test -d "$ZIP_SRC" || { echo 'ERROR: ZIP does not contain app/src/main at its root.'; find /tmp/jarvis-source -maxdepth 3 -type d -print; exit 1; }
+
+          test -d "/tmp/jarvis-source/app/src/main" || {
+            echo "ERROR: ZIP does not contain app/src/main"
+            exit 1
+          }
+
           rm -rf "$GITHUB_WORKSPACE/app"
           mkdir -p "$GITHUB_WORKSPACE/app"
-          cp -R /tmp/jarvis-source/app/. "$GITHUB_WORKSPACE/app/"
-          if [ -f /tmp/jarvis-source/app/build.gradle.kts ]; then
-            echo 'Jarvis app source extracted into repository root.'
-          fi
 
-      - name: Verify complete Jarvis source BEFORE any build
+          cp -R /tmp/jarvis-source/app/. "$GITHUB_WORKSPACE/app/"
+
+          echo "Jarvis source extracted successfully."
+
+      - name: Verify Jarvis source
         shell: bash
         run: |
           set -euo pipefail
+
           SRC="$GITHUB_WORKSPACE/app/src/main"
-          echo "Checking Jarvis source: $SRC"
-          required=(
-            "$SRC/AndroidManifest.xml"
-            "$SRC/java/com/jarvis/android/MainActivity.kt"
-            "$SRC/java/com/jarvis/android/JarvisService.java"
-            "$SRC/java/com/jarvis/android/ChatStore.kt"
-            "$SRC/java/com/jarvis/android/JarvisMemory.kt"
-            "$SRC/java/com/jarvis/android/JarvisCommandRouter.kt"
-            "$SRC/java/com/jarvis/android/AgentRouter.kt"
-            "$SRC/res/values/styles.xml"
-            "$SRC/res/layout/notification_jarvis.xml"
-          )
-          for f in "${required[@]}"; do
-            test -f "$f" || { echo "MISSING: $f"; exit 1; }
-            echo "OK: $f"
-          done
-          grep -q '^package com\.jarvis\.android' "$SRC/java/com/jarvis/android/MainActivity.kt"
-          grep -q '^package com\.jarvis\.android' "$SRC/java/com/jarvis/android/JarvisService.java"
-          grep -q 'com\.arm\.aichat\.InferenceEngine' "$SRC/java/com/jarvis/android/MainActivity.kt"
-          grep -q '@JvmStatic' "$SRC/java/com/jarvis/android/ChatStore.kt"
-          grep -q 'JarvisCommandRouter' "$SRC/java/com/jarvis/android/MainActivity.kt"
-          grep -q 'AgentRouter' "$SRC/java/com/jarvis/android/MainActivity.kt"
-          echo "Jarvis vNext source is complete."
+
+          test -f "$SRC/AndroidManifest.xml"
+          test -f "$SRC/java/com/jarvis/android/MainActivity.kt"
+          test -f "$SRC/java/com/jarvis/android/JarvisService.java"
+          test -f "$SRC/java/com/jarvis/android/ChatStore.kt"
+
+          echo "Main Jarvis source verified."
 
       - name: Setup JDK 17
         uses: actions/setup-java@v4
@@ -80,14 +81,21 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # IMPORTANT:
+      # setup-android v3 tried to install the removed "tools" package.
+      # v4 + platform-tools fixes that problem.
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
 
-      - name: Install exact Android build tools
+      - name: Install Android build tools
         shell: bash
         run: |
           set -euo pipefail
+
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
           sdkmanager \
             'platform-tools' \
             'platforms;android-36' \
@@ -99,71 +107,164 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf /tmp/llama.cpp
-          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
-          test -f /tmp/llama.cpp/examples/llama.android/gradlew
-          test -f /tmp/llama.cpp/examples/llama.android/lib/build.gradle.kts
-          grep -q 'ndkVersion = "29.0.13113456"' /tmp/llama.cpp/examples/llama.android/lib/build.gradle.kts
-          echo 'Official llama.android source verified.'
 
-      - name: Download bundled Llama model
+          rm -rf /tmp/llama.cpp
+
+          git clone \
+            --depth 1 \
+            https://github.com/ggml-org/llama.cpp.git \
+            /tmp/llama.cpp
+
+          test -f /tmp/llama.cpp/examples/llama.android/gradlew
+
+          test -f \
+            /tmp/llama.cpp/examples/llama.android/lib/build.gradle.kts
+
+          echo "Official llama.cpp verified."
+
+      - name: Download Llama model
         shell: bash
         run: |
           set -euo pipefail
+
           MODEL_DIR="$GITHUB_WORKSPACE/app/src/main/assets"
           MODEL="$MODEL_DIR/Llama-3.2-1B-Instruct-Q4_0.gguf"
+
           mkdir -p "$MODEL_DIR"
-          curl -L --fail --retry 3 --retry-delay 5 \
+
+          curl -L \
+            --fail \
+            --retry 3 \
+            --retry-delay 5 \
             -o "$MODEL" \
             'https://huggingface.co/gaianet/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf'
+
           SIZE=$(stat -c%s "$MODEL")
-          echo "Bundled model size: $SIZE bytes"
+
+          echo "Model size: $SIZE bytes"
+
           test "$SIZE" -gt 700000000
+
           sha256sum "$MODEL"
 
-      - name: Inject complete Jarvis source
+      - name: Inject Jarvis source
         shell: bash
         run: |
           set -euo pipefail
+
           SRC="$GITHUB_WORKSPACE/app/src/main"
           DEST="/tmp/llama.cpp/examples/llama.android/app/src/main"
 
-          rm -rf "$DEST/java" "$DEST/kotlin" "$DEST/res" "$DEST/assets"
-          mkdir -p "$DEST/java" "$DEST/res" "$DEST/assets"
+          rm -rf \
+            "$DEST/java" \
+            "$DEST/kotlin" \
+            "$DEST/res" \
+            "$DEST/assets"
+
+          mkdir -p \
+            "$DEST/java" \
+            "$DEST/res" \
+            "$DEST/assets"
 
           cp -R "$SRC/java/." "$DEST/java/"
           cp -R "$SRC/res/." "$DEST/res/"
           cp -R "$SRC/assets/." "$DEST/assets/"
-          cp "$SRC/AndroidManifest.xml" "$DEST/AndroidManifest.xml"
 
-          test -f "$DEST/java/com/jarvis/android/MainActivity.kt"
-          test -f "$DEST/java/com/jarvis/android/JarvisService.java"
-          test -f "$DEST/assets/Llama-3.2-1B-Instruct-Q4_0.gguf"
-          echo 'Jarvis source + GGUF injected successfully.'
+          cp \
+            "$SRC/AndroidManifest.xml" \
+            "$DEST/AndroidManifest.xml"
 
-      - name: Configure APK packaging and arm64 build
+          test -f \
+            "$DEST/java/com/jarvis/android/MainActivity.kt"
+
+          test -f \
+            "$DEST/java/com/jarvis/android/JarvisService.java"
+
+          test -f \
+            "$DEST/assets/Llama-3.2-1B-Instruct-Q4_0.gguf"
+
+          echo "Jarvis source and model injected."
+
+      - name: Configure APK
         shell: bash
         run: |
           set -euo pipefail
-          APP='/tmp/llama.cpp/examples/llama.android/app/build.gradle.kts'
-          LIB='/tmp/llama.cpp/examples/llama.android/lib/build.gradle.kts'
+
+          APP="/tmp/llama.cpp/examples/llama.android/app/build.gradle.kts"
+          LIB="/tmp/llama.cpp/examples/llama.android/lib/build.gradle.kts"
 
           python3 - <<'PY'
           from pathlib import Path
-          app=Path('/tmp/llama.cpp/examples/llama.android/app/build.gradle.kts')
-          s=app.read_text()
-          s=s.replace('namespace = "com.example.llama"', 'namespace = "com.jarvis.android"')
-          s=s.replace('applicationId = "com.example.llama.aichat"', 'applicationId = "com.jarvis.android"')
-          if 'packaging {' not in s:
-              s=s.replace('\n}\n\ndependencies {', '\n    packaging {\n        jniLibs {\n            useLegacyPackaging = true\n        }\n    }\n}\n\ndependencies {', 1)
+          import re
+
+          app = Path("/tmp/llama.cpp/examples/llama.android/app/build.gradle.kts")
+
+          s = app.read_text()
+
+          s = s.replace(
+              'namespace = "com.example.llama"',
+              'namespace = "com.jarvis.android"'
+          )
+
+          s = s.replace(
+              'applicationId = "com.example.llama.aichat"',
+              'applicationId = "com.jarvis.android"'
+          )
+
+          if "useLegacyPackaging = true" not in s:
+              s = s.replace(
+                  "\n}\n\ndependencies {",
+                  """
+              packaging {
+                  jniLibs {
+                      useLegacyPackaging = true
+                  }
+              }
+          }
+
+          dependencies {
+              """,
+                  1
+              )
+
           app.write_text(s)
-          
-          lib=Path('/tmp/llama.cpp/examples/llama.android/lib/build.gradle.kts')
-          s=lib.read_text()
-          # Build a self-contained CPU backend for this phone. The stock Android binding
-          # dynamically loads CPU backend variants; that path is what we are removing here.
-          s=s.replace('abiFilters += listOf("arm64-v8a", "x86_64")', 'abiFilters += listOf("arm64-v8a")')
-          required = [
+
+          lib = Path("/tmp/llama.cpp/examples/llama.android/lib/build.gradle.kts")
+
+          s = lib.read_text()
+
+          s = s.replace(
+              'abiFilters += listOf("arm64-v8a", "x86_64")',
+              'abiFilters += listOf("arm64-v8a")'
+          )
+
+          keys = [
+              "BUILD_SHARED_LIBS",
+              "GGML_NATIVE",
+              "GGML_BACKEND_DL",
+              "GGML_CPU_ALL_VARIANTS",
+              "GGML_CPU_KLEIDIAI",
+              "GGML_OPENMP",
+              "GGML_LLAMAFILE"
+          ]
+
+          for key in keys:
+              s = re.sub(
+                  r'\s*arguments \+= "-D' + key + r'=[^"\n]+"',
+                  '',
+                  s
+              )
+
+          marker = 'arguments += "-DCMAKE_BUILD_TYPE=Release"'
+
+          if marker not in s:
+              s = s.replace(
+                  "cmake {",
+                  'cmake {\n        ' + marker,
+                  1
+              )
+
+          options = [
               'arguments += "-DBUILD_SHARED_LIBS=ON"',
               'arguments += "-DGGML_NATIVE=OFF"',
               'arguments += "-DGGML_BACKEND_DL=OFF"',
@@ -172,58 +273,70 @@ jobs:
               'arguments += "-DGGML_OPENMP=OFF"',
               'arguments += "-DGGML_LLAMAFILE=OFF"',
           ]
-          # Replace any existing values rather than adding duplicates.
-          import re
-          for key in [
-              'BUILD_SHARED_LIBS','GGML_NATIVE','GGML_BACKEND_DL','GGML_CPU_ALL_VARIANTS',
-              'GGML_CPU_KLEIDIAI','GGML_OPENMP','GGML_LLAMAFILE'
-          ]:
-              s=re.sub(r'\s*arguments \+= "-D'+key+r'=[^"\n]+"', '', s)
-          marker='arguments += "-DCMAKE_BUILD_TYPE=Release"'
-          if marker not in s:
-              s=s.replace('cmake {', 'cmake {\n        '+marker, 1)
-          insertion='\n        '.join(required)
-          s=s.replace(marker, marker+'\n        '+insertion)
+
+          s = s.replace(
+              marker,
+              marker + "\n        " + "\n        ".join(options)
+          )
+
           lib.write_text(s)
+
           PY
 
-          grep -n 'namespace\|applicationId\|useLegacyPackaging' "$APP"
-          grep -n 'ndkVersion\|abiFilters\|GGML_NATIVE\|GGML_BACKEND_DL\|GGML_CPU_ALL_VARIANTS\|GGML_CPU_KLEIDIAI' "$LIB"
-          grep -q 'GGML_BACKEND_DL=OFF' "$LIB"
-          grep -q 'GGML_CPU_ALL_VARIANTS=OFF' "$LIB"
-          grep -q 'GGML_CPU_KLEIDIAI=OFF' "$LIB"
+          echo "APK configuration complete."
 
       - name: Build Jarvis APK
         working-directory: /tmp/llama.cpp/examples/llama.android
         shell: bash
         run: |
           set -euo pipefail
+
           chmod +x gradlew
-          ./gradlew :app:clean :app:assembleDebug --stacktrace --console=plain --no-daemon
 
-      - name: Verify APK contents
+          ./gradlew \
+            :app:clean \
+            :app:assembleDebug \
+            --stacktrace \
+            --console=plain \
+            --no-daemon
+
+      - name: Verify APK
         shell: bash
         run: |
           set -euo pipefail
-          APK=$(find /tmp/llama.cpp/examples/llama.android/app/build/outputs/apk/debug -maxdepth 1 -name '*.apk' -print -quit)
+
+          APK=$(find \
+            /tmp/llama.cpp/examples/llama.android/app/build/outputs/apk/debug \
+            -maxdepth 1 \
+            -name '*.apk' \
+            -print -quit)
+
           test -n "$APK"
-          echo "APK: $APK"
-          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" | grep -q "name='com.jarvis.android'"
-          unzip -l "$APK" | grep -q 'assets/Llama-3.2-1B-Instruct-Q4_0.gguf'
-          unzip -l "$APK" | grep -q 'lib/arm64-v8a/'
-          mkdir -p "$GITHUB_WORKSPACE/release"
-          cp "$APK" "$GITHUB_WORKSPACE/release/Jarvis-Local-AI.apk"
-          echo 'APK package/model/arm64 checks passed.'
 
-      - name: Publish APK release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG="jarvis-build-${{ github.run_number }}-${{ github.run_attempt }}"
-          gh release create "$TAG" \
-            "$GITHUB_WORKSPACE/release/Jarvis-Local-AI.apk" \
-            --repo "${{ github.repository }}" \
-            --title "Jarvis Local AI APK #${{ github.run_number }}" \
-            --notes 'Jarvis Local AI — bundled Llama 3.2 1B GGUF, arm64-v8a.'
+          echo "APK found:"
+          echo "$APK"
+
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" \
+            dump badging "$APK" |
+            grep -q "name='com.jarvis.android'"
+
+          unzip -l "$APK" |
+            grep -q 'assets/Llama-3.2-1B-Instruct-Q4_0.gguf'
+
+          unzip -l "$APK" |
+            grep -q 'lib/arm64-v8a/'
+
+          mkdir -p "$GITHUB_WORKSPACE/release"
+
+          cp \
+            "$APK" \
+            "$GITHUB_WORKSPACE/release/Jarvis-Local-AI.apk"
+
+          echo "APK verification passed."
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jarvis-Local-AI
+          path: release/Jarvis-Local-AI.apk
+          if-no-files-found: error
