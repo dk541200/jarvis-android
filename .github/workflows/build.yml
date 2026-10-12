@@ -228,6 +228,52 @@ jobs:
           chmod +x ./gradlew
           ./gradlew --no-daemon --stacktrace --console=plain :app:clean :app:assembleDebug
 
+      # Use one private signing key stored in GitHub Actions secrets. Without this,
+      # each fresh GitHub runner creates a different debug certificate and Android
+      # can reject updates over an already-installed Jarvis build.
+      - name: Sign APK with persistent Jarvis key
+        shell: bash
+        env:
+          JARVIS_KEYSTORE_BASE64: ${{ secrets.JARVIS_KEYSTORE_BASE64 }}
+          JARVIS_KEYSTORE_PASSWORD: ${{ secrets.JARVIS_KEYSTORE_PASSWORD }}
+          JARVIS_KEY_ALIAS: ${{ secrets.JARVIS_KEY_ALIAS }}
+          JARVIS_KEY_PASSWORD: ${{ secrets.JARVIS_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          for name in JARVIS_KEYSTORE_BASE64 JARVIS_KEYSTORE_PASSWORD JARVIS_KEY_ALIAS JARVIS_KEY_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "ERROR: GitHub Actions secret $name is missing. Create the four JARVIS signing secrets before building."
+              exit 1
+            fi
+          done
+
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/36.0.0"
+          APK="$LLAMA_ANDROID_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          KEYSTORE="$RUNNER_TEMP/jarvis-release.jks"
+          ALIGNED="$RUNNER_TEMP/Jarvis-aligned.apk"
+          SIGNED="$RUNNER_TEMP/Jarvis-signed.apk"
+          trap 'rm -f "$KEYSTORE" "$ALIGNED" "$SIGNED"' EXIT
+
+          printf '%s' "$JARVIS_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+          test -s "$KEYSTORE"
+          test -f "$APK"
+
+          # Align first, then sign. Do not modify the APK after signing.
+          "$BUILD_TOOLS/zipalign" -f 4 "$APK" "$ALIGNED"
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks "$KEYSTORE" \
+            --ks-key-alias "$JARVIS_KEY_ALIAS" \
+            --ks-pass env:JARVIS_KEYSTORE_PASSWORD \
+            --key-pass env:JARVIS_KEY_PASSWORD \
+            --out "$SIGNED" \
+            "$ALIGNED"
+
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$SIGNED"
+          "$BUILD_TOOLS/zipalign" -c 4 "$SIGNED"
+          mv "$SIGNED" "$APK"
+          echo "APK signed with the persistent Jarvis signing certificate."
+
       - name: Verify APK contains model and native inference library
         shell: bash
         run: |
@@ -255,7 +301,7 @@ jobs:
           name: Jarvis Embedded AI Build ${{ github.run_number }}
           target_commitish: ${{ github.sha }}
           body: |
-            Jarvis Android debug APK with the Qwen3-1.7B Q4_K_M local model and llama.cpp native inference library embedded.
+            Jarvis Android APK with the Qwen3-1.7B Q4_K_M local model and llama.cpp native inference library embedded. Signed with the persistent JARVIS signing key.
 
             The APK is large (around 1.3 GB). First launch copies the model to private app storage, so keep at least about 2.6 GB free.
             Image understanding still requires a configured vision-capable online or external model.
@@ -269,3 +315,4 @@ jobs:
           prerelease: false
           make_latest: true
           overwrite_files: true
+          
