@@ -1,95 +1,80 @@
-name: Build Jarvis APK
+
+name: Build and Publish Jarvis APK
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
+    paths:
+      - 'Jarvis-Complete-Source.zip'
+      - '.github/workflows/build.yml'
 
 permissions:
   contents: write
 
+concurrency:
+  group: jarvis-apk-release
+  cancel-in-progress: false
+
 jobs:
-  build:
-    name: Build Jarvis Local AI APK
+  build-and-release:
+    name: Build APK and publish to Releases
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract uploaded Jarvis source ZIP
+      - name: Check source ZIP
         shell: bash
         run: |
           set -euo pipefail
 
-          ZIP=""
+          ZIP="$GITHUB_WORKSPACE/Jarvis-Complete-Source.zip"
 
-          while IFS= read -r -d '' f; do
-            if unzip -l "$f" | grep -q 'app/src/main/java/com/jarvis/android/MainActivity.kt'; then
-              ZIP="$f"
-              break
-            fi
-          done < <(
-            find "$GITHUB_WORKSPACE" \
-              -maxdepth 1 \
-              -type f \
-              -iname '*.zip' \
-              -print0
-          )
-
-          test -n "$ZIP" || {
-            echo "ERROR: Jarvis source ZIP not found."
+          test -f "$ZIP" || {
+            echo "ERROR: Jarvis-Complete-Source.zip not found in repository root"
             exit 1
           }
 
-          echo "Using source ZIP: $ZIP"
+          unzip -t "$ZIP"
 
-          rm -rf /tmp/jarvis-source
-          mkdir -p /tmp/jarvis-source
+          unzip -l "$ZIP" | grep -q \
+            'Jarvis-Complete/app/build.gradle.kts'
 
-          unzip -q "$ZIP" -d /tmp/jarvis-source
+          unzip -l "$ZIP" | grep -q \
+            'Jarvis-Complete/gradlew'
 
-          test -d "/tmp/jarvis-source/app/src/main" || {
-            echo "ERROR: ZIP does not contain app/src/main"
-            exit 1
-          }
-
-          rm -rf "$GITHUB_WORKSPACE/app"
-          mkdir -p "$GITHUB_WORKSPACE/app"
-
-          cp -R /tmp/jarvis-source/app/. "$GITHUB_WORKSPACE/app/"
-
-          echo "Jarvis source extracted successfully."
-
-      - name: Verify Jarvis source
+      - name: Extract source
         shell: bash
         run: |
           set -euo pipefail
 
-          SRC="$GITHUB_WORKSPACE/app/src/main"
+          mkdir -p "$RUNNER_TEMP/jarvis-source"
 
-          test -f "$SRC/AndroidManifest.xml"
-          test -f "$SRC/java/com/jarvis/android/MainActivity.kt"
-          test -f "$SRC/java/com/jarvis/android/JarvisService.java"
-          test -f "$SRC/java/com/jarvis/android/ChatStore.kt"
+          unzip -q \
+            "$GITHUB_WORKSPACE/Jarvis-Complete-Source.zip" \
+            -d "$RUNNER_TEMP/jarvis-source"
 
-          echo "Main Jarvis source verified."
+          PROJECT="$RUNNER_TEMP/jarvis-source/Jarvis-Complete"
 
-      - name: Setup JDK 17
+          test -f "$PROJECT/settings.gradle.kts"
+          test -f "$PROJECT/app/build.gradle.kts"
+          test -f "$PROJECT/app/src/main/AndroidManifest.xml"
+
+          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
+
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # IMPORTANT:
-      # setup-android v3 tried to install the removed "tools" package.
-      # v4 + platform-tools fixes that problem.
-      - name: Setup Android SDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v4
-        with:
-          packages: 'platform-tools'
 
-      - name: Install Android build tools
+      - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
@@ -98,245 +83,55 @@ jobs:
 
           sdkmanager \
             'platform-tools' \
-            'platforms;android-36' \
-            'build-tools;36.0.0' \
-            'cmake;3.31.6' \
-            'ndk;29.0.13113456'
+            'platforms;android-35' \
+            'build-tools;35.0.0'
 
-      - name: Download official llama.cpp
+      - name: Build installable APK
         shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf /tmp/llama.cpp
-
-          git clone \
-            --depth 1 \
-            https://github.com/ggml-org/llama.cpp.git \
-            /tmp/llama.cpp
-
-          test -f /tmp/llama.cpp/examples/llama.android/gradlew
-
-          test -f \
-            /tmp/llama.cpp/examples/llama.android/lib/build.gradle.kts
-
-          echo "Official llama.cpp verified."
-
-      - name: Download Llama model
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          MODEL_DIR="$GITHUB_WORKSPACE/app/src/main/assets"
-          MODEL="$MODEL_DIR/Llama-3.2-1B-Instruct-Q4_0.gguf"
-
-          mkdir -p "$MODEL_DIR"
-
-          curl -L \
-            --fail \
-            --retry 3 \
-            --retry-delay 5 \
-            -o "$MODEL" \
-            'https://huggingface.co/gaianet/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf'
-
-          SIZE=$(stat -c%s "$MODEL")
-
-          echo "Model size: $SIZE bytes"
-
-          test "$SIZE" -gt 700000000
-
-          sha256sum "$MODEL"
-
-      - name: Inject Jarvis source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SRC="$GITHUB_WORKSPACE/app/src/main"
-          DEST="/tmp/llama.cpp/examples/llama.android/app/src/main"
-
-          rm -rf \
-            "$DEST/java" \
-            "$DEST/kotlin" \
-            "$DEST/res" \
-            "$DEST/assets"
-
-          mkdir -p \
-            "$DEST/java" \
-            "$DEST/res" \
-            "$DEST/assets"
-
-          cp -R "$SRC/java/." "$DEST/java/"
-          cp -R "$SRC/res/." "$DEST/res/"
-          cp -R "$SRC/assets/." "$DEST/assets/"
-
-          cp \
-            "$SRC/AndroidManifest.xml" \
-            "$DEST/AndroidManifest.xml"
-
-          test -f \
-            "$DEST/java/com/jarvis/android/MainActivity.kt"
-
-          test -f \
-            "$DEST/java/com/jarvis/android/JarvisService.java"
-
-          test -f \
-            "$DEST/assets/Llama-3.2-1B-Instruct-Q4_0.gguf"
-
-          echo "Jarvis source and model injected."
-
-      - name: Configure APK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          APP="/tmp/llama.cpp/examples/llama.android/app/build.gradle.kts"
-          LIB="/tmp/llama.cpp/examples/llama.android/lib/build.gradle.kts"
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          app = Path("/tmp/llama.cpp/examples/llama.android/app/build.gradle.kts")
-
-          s = app.read_text()
-
-          s = s.replace(
-              'namespace = "com.example.llama"',
-              'namespace = "com.jarvis.android"'
-          )
-
-          s = s.replace(
-              'applicationId = "com.example.llama.aichat"',
-              'applicationId = "com.jarvis.android"'
-          )
-
-          if "useLegacyPackaging = true" not in s:
-              s = s.replace(
-                  "\n}\n\ndependencies {",
-                  """
-              packaging {
-                  jniLibs {
-                      useLegacyPackaging = true
-                  }
-              }
-          }
-
-          dependencies {
-              """,
-                  1
-              )
-
-          app.write_text(s)
-
-          lib = Path("/tmp/llama.cpp/examples/llama.android/lib/build.gradle.kts")
-
-          s = lib.read_text()
-
-          s = s.replace(
-              'abiFilters += listOf("arm64-v8a", "x86_64")',
-              'abiFilters += listOf("arm64-v8a")'
-          )
-
-          keys = [
-              "BUILD_SHARED_LIBS",
-              "GGML_NATIVE",
-              "GGML_BACKEND_DL",
-              "GGML_CPU_ALL_VARIANTS",
-              "GGML_CPU_KLEIDIAI",
-              "GGML_OPENMP",
-              "GGML_LLAMAFILE"
-          ]
-
-          for key in keys:
-              s = re.sub(
-                  r'\s*arguments \+= "-D' + key + r'=[^"\n]+"',
-                  '',
-                  s
-              )
-
-          marker = 'arguments += "-DCMAKE_BUILD_TYPE=Release"'
-
-          if marker not in s:
-              s = s.replace(
-                  "cmake {",
-                  'cmake {\n        ' + marker,
-                  1
-              )
-
-          options = [
-              'arguments += "-DBUILD_SHARED_LIBS=ON"',
-              'arguments += "-DGGML_NATIVE=OFF"',
-              'arguments += "-DGGML_BACKEND_DL=OFF"',
-              'arguments += "-DGGML_CPU_ALL_VARIANTS=OFF"',
-              'arguments += "-DGGML_CPU_KLEIDIAI=OFF"',
-              'arguments += "-DGGML_OPENMP=OFF"',
-              'arguments += "-DGGML_LLAMAFILE=OFF"',
-          ]
-
-          s = s.replace(
-              marker,
-              marker + "\n        " + "\n        ".join(options)
-          )
-
-          lib.write_text(s)
-
-          PY
-
-          echo "APK configuration complete."
-
-      - name: Build Jarvis APK
-        working-directory: /tmp/llama.cpp/examples/llama.android
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          chmod +x gradlew
+          cd "$PROJECT_DIR"
+          chmod +x ./gradlew
 
           ./gradlew \
-            :app:clean \
-            :app:assembleDebug \
+            --no-daemon \
             --stacktrace \
-            --console=plain \
-            --no-daemon
+            :app:assembleDebug
 
-      - name: Verify APK
+          test -f app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Prepare release files
         shell: bash
         run: |
           set -euo pipefail
 
-          APK=$(find \
-            /tmp/llama.cpp/examples/llama.android/app/build/outputs/apk/debug \
-            -maxdepth 1 \
-            -name '*.apk' \
-            -print -quit)
-
-          test -n "$APK"
-
-          echo "APK found:"
-          echo "$APK"
-
-          "$ANDROID_HOME/build-tools/36.0.0/aapt" \
-            dump badging "$APK" |
-            grep -q "name='com.jarvis.android'"
-
-          unzip -l "$APK" |
-            grep -q 'assets/Llama-3.2-1B-Instruct-Q4_0.gguf'
-
-          unzip -l "$APK" |
-            grep -q 'lib/arm64-v8a/'
-
-          mkdir -p "$GITHUB_WORKSPACE/release"
+          mkdir -p "$GITHUB_WORKSPACE/release-assets"
 
           cp \
-            "$APK" \
-            "$GITHUB_WORKSPACE/release/Jarvis-Local-AI.apk"
+            "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" \
+            "$GITHUB_WORKSPACE/release-assets/Jarvis-Complete.apk"
 
-          echo "APK verification passed."
+          sha256sum \
+            "$GITHUB_WORKSPACE/release-assets/Jarvis-Complete.apk" \
+            > "$GITHUB_WORKSPACE/release-assets/SHA256SUMS.txt"
 
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+      - name: Publish APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
         with:
-          name: Jarvis-Local-AI
-          path: release/Jarvis-Local-AI.apk
-          if-no-files-found: error
+          tag_name: build-${{ github.run_number }}
+          name: Jarvis APK Build ${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            Jarvis Android APK.
+
+            Download Jarvis-Complete.apk from the release assets.
+            This is a debug-signed APK for testing.
+          files: |
+            release-assets/Jarvis-Complete.apk
+            release-assets/SHA256SUMS.txt
+          draft: false
+          prerelease: false
+          make_latest: true
+          overwrite_files: true
+          
