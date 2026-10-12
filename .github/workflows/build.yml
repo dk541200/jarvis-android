@@ -1,0 +1,250 @@
+name: Build Jarvis APK with Embedded Local AI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'Jarvis-Complete-Source.zip'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: jarvis-embedded-apk-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build APK with Qwen3 1.7B + llama.cpp
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="$GITHUB_WORKSPACE/Jarvis-Complete-Source.zip"
+          test -f "$ZIP" || { echo "ERROR: Jarvis-Complete-Source.zip not found in repository root"; exit 1; }
+          unzip -t "$ZIP"
+          unzip -l "$ZIP" | grep -q 'Jarvis-Complete/app/src/main/java/com/jarvis/android/EmbeddedLocalModel.kt'
+          unzip -l "$ZIP" | grep -q 'Jarvis-Complete/app/src/main/java/com/jarvis/android/JarvisEngine.kt'
+          unzip -l "$ZIP" | grep -q 'Jarvis-Complete/app/src/main/AndroidManifest.xml'
+
+      - name: Extract Jarvis source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/jarvis-source"
+          unzip -q "$GITHUB_WORKSPACE/Jarvis-Complete-Source.zip" -d "$RUNNER_TEMP/jarvis-source"
+          PROJECT="$RUNNER_TEMP/jarvis-source/Jarvis-Complete"
+          test -f "$PROJECT/README.md"
+          test -f "$PROJECT/app/src/main/java/com/jarvis/android/MainActivity.kt"
+          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
+
+      - name: Clone official llama.cpp Android binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          LLAMA_CPP_REF='972b5fcc19670e597f8de9bf5cacfb85752a5fff'
+          git clone --filter=blob:none --no-checkout https://github.com/ggml-org/llama.cpp.git "$RUNNER_TEMP/llama.cpp"
+          git -C "$RUNNER_TEMP/llama.cpp" fetch --depth 1 origin "$LLAMA_CPP_REF"
+          git -C "$RUNNER_TEMP/llama.cpp" checkout --detach "$LLAMA_CPP_REF"
+          git -C "$RUNNER_TEMP/llama.cpp" submodule update --init --depth 1
+          BASE="$RUNNER_TEMP/llama.cpp/examples/llama.android"
+          test -f "$BASE/lib/src/main/java/com/arm/aichat/InferenceEngine.kt"
+          test -f "$BASE/lib/src/main/cpp/CMakeLists.txt"
+          echo "LLAMA_ANDROID_DIR=$BASE" >> "$GITHUB_ENV"
+          echo "LLAMA_CPP_ROOT=$RUNNER_TEMP/llama.cpp" >> "$GITHUB_ENV"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK, NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            'platform-tools' \
+            'platforms;android-36' \
+            'build-tools;36.0.0' \
+            'cmake;3.31.6' \
+            'ndk;29.0.13113456'
+
+      - name: Download Qwen3 1.7B Q4_K_M model
+        shell: bash
+        run: |
+          set -euo pipefail
+          MODEL_NAME='Qwen3-1.7B-Q4_K_M.gguf'
+          MODEL_DIR="$LLAMA_ANDROID_DIR/app/src/main/assets"
+          MODEL="$MODEL_DIR/$MODEL_NAME"
+          mkdir -p "$MODEL_DIR"
+          curl --fail --location --show-error \
+            --retry 4 --retry-delay 5 --connect-timeout 30 --max-time 3600 \
+            -H 'User-Agent: Jarvis-Android-Build' \
+            -o "$MODEL" \
+            'https://huggingface.co/gaianet/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf'
+          # Retain the model and runtime license notices in the APK assets.
+          curl --fail --location --show-error --retry 3 \
+            -o "$MODEL_DIR/LICENSE-APACHE-2.0.txt" \
+            'https://www.apache.org/licenses/LICENSE-2.0.txt'
+          cp "$LLAMA_CPP_ROOT/LICENSE" "$MODEL_DIR/LICENSE-LLAMA-CPP.txt"
+          cat > "$MODEL_DIR/THIRD-PARTY-NOTICES.txt" <<'NOTICE'
+          Qwen3-1.7B Q4_K_M GGUF quantization: gaianet/Qwen3-1.7B-GGUF.
+          The underlying Qwen3 model is distributed under Apache License 2.0.
+          llama.cpp Android inference binding: ggml-org/llama.cpp (MIT License).
+          See the adjacent license files for terms.
+          NOTICE
+          SIZE=$(stat -c%s "$MODEL")
+          echo "Qwen3 model bytes: $SIZE"
+          test "$SIZE" -gt 1000000000 || { echo 'ERROR: model download is missing or unexpectedly small'; exit 1; }
+          sha256sum "$MODEL" | tee "$RUNNER_TEMP/model.sha256"
+
+      - name: Inject Jarvis app and configure native inference
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$PROJECT_DIR/app/src/main"
+          BASE="$LLAMA_ANDROID_DIR"
+          DEST="$BASE/app/src/main"
+
+          rm -rf "$DEST/java" "$DEST/kotlin" "$DEST/res"
+          mkdir -p "$DEST/java" "$DEST/res" "$DEST/assets"
+          cp -R "$SRC/." "$DEST/"
+
+          # Preserve the model downloaded before source injection; assets is not removed above.
+          # EmbeddedLocalModel copies it to app-private storage on first local use.
+          test "$(stat -c%s "$DEST/assets/Qwen3-1.7B-Q4_K_M.gguf")" -gt 1000000000
+
+          cat > "$BASE/app/build.gradle.kts" <<'GRADLE'
+          plugins {
+              alias(libs.plugins.android.application)
+              alias(libs.plugins.jetbrains.kotlin.android)
+              id("org.jetbrains.kotlin.plugin.compose") version "2.3.0"
+          }
+
+          android {
+              namespace = "com.jarvis.android"
+              compileSdk = 36
+              defaultConfig {
+                  applicationId = "com.jarvis.android"
+                  minSdk = 33
+                  targetSdk = 35
+                  versionCode = 3
+                  versionName = "3.0.0-local-model"
+                  testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+                  vectorDrawables { useSupportLibrary = true }
+              }
+              buildTypes {
+                  debug { isMinifyEnabled = false }
+                  release { isMinifyEnabled = false }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true; buildConfig = true }
+              packaging {
+                  jniLibs { useLegacyPackaging = true }
+                  resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+              }
+          }
+
+          dependencies {
+              implementation(project(":lib"))
+              implementation(platform("androidx.compose:compose-bom:2024.12.01"))
+              implementation("androidx.activity:activity-compose:1.10.0")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+              implementation("androidx.security:security-crypto:1.1.0-alpha06")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+              debugImplementation("androidx.compose.ui:ui-tooling")
+          }
+          GRADLE
+
+          # Disable optional arm64-specific OpenMP/KleidiAI paths for more robust compatibility.
+          CMAKE_FILE="$BASE/lib/src/main/cpp/CMakeLists.txt"
+          sed -i 's/set(GGML_CPU_KLEIDIAI ON)/set(GGML_CPU_KLEIDIAI OFF)/' "$CMAKE_FILE"
+          sed -i 's/set(GGML_OPENMP ON)/set(GGML_OPENMP OFF)/' "$CMAKE_FILE"
+          sed -i 's/arguments += "-DGGML_BACKEND_DL=ON"/arguments += "-DGGML_BACKEND_DL=OFF"/' "$BASE/lib/build.gradle.kts"
+          sed -i 's/arguments += "-DGGML_CPU_ALL_VARIANTS=ON"/arguments += "-DGGML_CPU_ALL_VARIANTS=OFF"/' "$BASE/lib/build.gradle.kts"
+          sed -i 's/arguments += "-DGGML_OPENMP=ON"/arguments += "-DGGML_OPENMP=OFF"/' "$BASE/lib/build.gradle.kts"
+          sed -i 's/arguments += "-DGGML_CPU_KLEIDIAI=ON"/arguments += "-DGGML_CPU_KLEIDIAI=OFF"/' "$BASE/lib/build.gradle.kts"
+          sed -i 's/abiFilters += listOf("arm64-v8a", "x86_64")/abiFilters += listOf("arm64-v8a")/' "$BASE/lib/build.gradle.kts"
+
+          test -f "$DEST/java/com/jarvis/android/EmbeddedLocalModel.kt"
+          test -f "$DEST/java/com/jarvis/android/JarvisEngine.kt"
+          test -f "$DEST/assets/Qwen3-1.7B-Q4_K_M.gguf"
+          grep -q 'implementation(project(":lib"))' "$BASE/app/build.gradle.kts"
+          test -f "$DEST/assets/LICENSE-APACHE-2.0.txt"
+          test -f "$DEST/assets/LICENSE-LLAMA-CPP.txt"
+          echo 'Jarvis source + native llama.cpp + bundled Qwen3 model configured.'
+
+      - name: Build APK with embedded model
+        working-directory: ${{ env.LLAMA_ANDROID_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace --console=plain :app:clean :app:assembleDebug
+
+      - name: Verify APK contains model and native inference library
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$LLAMA_ANDROID_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$APK"
+          APK_SIZE=$(stat -c%s "$APK")
+          echo "APK bytes: $APK_SIZE"
+          test "$APK_SIZE" -gt 1000000000 || { echo 'ERROR: APK is too small; bundled model may be missing'; exit 1; }
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" | grep -q "name='com.jarvis.android'"
+          unzip -l "$APK" | grep -q 'assets/Qwen3-1.7B-Q4_K_M.gguf'
+          unzip -l "$APK" | grep -q 'lib/arm64-v8a/libai-chat.so'
+          mkdir -p "$GITHUB_WORKSPACE/release-assets"
+          cp "$APK" "$GITHUB_WORKSPACE/release-assets/Jarvis-Embedded-Qwen3-1.7B.apk"
+          cp "$LLAMA_CPP_ROOT/LICENSE" "$GITHUB_WORKSPACE/release-assets/LICENSE-LLAMA-CPP.txt"
+          cp "$LLAMA_ANDROID_DIR/app/src/main/assets/LICENSE-APACHE-2.0.txt" "$GITHUB_WORKSPACE/release-assets/LICENSE-APACHE-2.0.txt"
+          cp "$LLAMA_ANDROID_DIR/app/src/main/assets/THIRD-PARTY-NOTICES.txt" "$GITHUB_WORKSPACE/release-assets/THIRD-PARTY-NOTICES.txt"
+          sha256sum "$GITHUB_WORKSPACE/release-assets/Jarvis-Embedded-Qwen3-1.7B.apk" > "$GITHUB_WORKSPACE/release-assets/SHA256SUMS.txt"
+          echo 'APK contains GGUF model and native inference library.'
+
+      - name: Publish APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Jarvis Embedded AI Build ${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            Jarvis Android debug APK with the Qwen3-1.7B Q4_K_M local model and llama.cpp native inference library embedded.
+
+            The APK is large (around 1.3 GB). First launch copies the model to private app storage, so keep at least about 2.6 GB free.
+            Image understanding still requires a configured vision-capable online or external model.
+          files: |
+            release-assets/Jarvis-Embedded-Qwen3-1.7B.apk
+            release-assets/SHA256SUMS.txt
+            release-assets/LICENSE-LLAMA-CPP.txt
+            release-assets/LICENSE-APACHE-2.0.txt
+            release-assets/THIRD-PARTY-NOTICES.txt
+          draft: false
+          prerelease: false
+          make_latest: true
+          overwrite_files: true
