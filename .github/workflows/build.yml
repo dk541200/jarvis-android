@@ -96,7 +96,6 @@ jobs:
             -H 'User-Agent: Jarvis-Android-Build' \
             -o "$MODEL" \
             'https://huggingface.co/gaianet/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf'
-          # Retain the model and runtime license notices in the APK assets.
           curl --fail --location --show-error --retry 3 \
             -o "$MODEL_DIR/LICENSE-APACHE-2.0.txt" \
             'https://www.apache.org/licenses/LICENSE-2.0.txt'
@@ -123,9 +122,6 @@ jobs:
           rm -rf "$DEST/java" "$DEST/kotlin" "$DEST/res"
           mkdir -p "$DEST/java" "$DEST/res" "$DEST/assets"
           cp -R "$SRC/." "$DEST/"
-
-          # Preserve the model downloaded before source injection; assets is not removed above.
-          # EmbeddedLocalModel copies it to app-private storage on first local use.
           test "$(stat -c%s "$DEST/assets/Qwen3-1.7B-Q4_K_M.gguf")" -gt 1000000000
 
           cat > "$BASE/app/build.gradle.kts" <<'GRADLE'
@@ -155,11 +151,18 @@ jobs:
                   sourceCompatibility = JavaVersion.VERSION_17
                   targetCompatibility = JavaVersion.VERSION_17
               }
-              kotlinOptions { jvmTarget = "17" }
               buildFeatures { compose = true; buildConfig = true }
               packaging {
                   jniLibs { useLegacyPackaging = true }
                   resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+              }
+          }
+
+          // Kotlin 2.3.0 removed the old kotlinOptions.jvmTarget DSL.
+          // The modern compilerOptions block belongs at project level, outside android {}.
+          kotlin {
+              compilerOptions {
+                  jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
               }
           }
 
@@ -181,7 +184,6 @@ jobs:
           }
           GRADLE
 
-          # Disable optional arm64-specific OpenMP/KleidiAI paths for more robust compatibility.
           CMAKE_FILE="$BASE/lib/src/main/cpp/CMakeLists.txt"
           sed -i 's/set(GGML_CPU_KLEIDIAI ON)/set(GGML_CPU_KLEIDIAI OFF)/' "$CMAKE_FILE"
           sed -i 's/set(GGML_OPENMP ON)/set(GGML_OPENMP OFF)/' "$CMAKE_FILE"
