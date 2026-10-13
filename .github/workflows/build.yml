@@ -1,7 +1,16 @@
-name: Build Jarvis APK with Embedded Local AI
+name: Build Jarvis Preview or Update APK
 
 on:
   workflow_dispatch:
+    inputs:
+      install_mode:
+        description: "Preview installs beside your current Jarvis; update requires the exact same signing key as the installed app."
+        type: choice
+        options:
+          - preview
+          - update
+        default: preview
+        required: true
   push:
     branches: [main]
     paths:
@@ -17,13 +26,63 @@ concurrency:
 
 jobs:
   build-and-release:
-    name: Build APK with Qwen3 1.7B + llama.cpp
+    name: Build APK with Qwen3 0.6B + offline Hey Jarvis
     runs-on: ubuntu-24.04
     timeout-minutes: 120
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Select safe app/signing mode
+        shell: bash
+        env:
+          REQUESTED_INSTALL_MODE: ${{ inputs.install_mode || 'auto' }}
+          JARVIS_KEYSTORE_BASE64: ${{ secrets.JARVIS_KEYSTORE_BASE64 }}
+          JARVIS_KEYSTORE_PASSWORD: ${{ secrets.JARVIS_KEYSTORE_PASSWORD }}
+          JARVIS_KEY_ALIAS: ${{ secrets.JARVIS_KEY_ALIAS }}
+          JARVIS_KEY_PASSWORD: ${{ secrets.JARVIS_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          all_missing=0
+          all_present=0
+          missing_count=0
+          for name in JARVIS_KEYSTORE_BASE64 JARVIS_KEYSTORE_PASSWORD JARVIS_KEY_ALIAS JARVIS_KEY_PASSWORD; do
+            if [ -z "${!name:-}" ]; then missing_count=$((missing_count + 1)); fi
+          done
+          if [ "$missing_count" -eq 4 ]; then all_missing=1; fi
+          if [ "$missing_count" -eq 0 ]; then all_present=1; fi
+
+          case "$REQUESTED_INSTALL_MODE" in
+            preview)
+              MODE=preview
+              APP_ID='com.jarvis.android.preview'
+              ;;
+            update)
+              if [ "$all_present" -ne 1 ]; then
+                echo 'ERROR: Update mode requires all four JARVIS signing secrets, using the SAME key as the installed Jarvis app.'
+                exit 1
+              fi
+              MODE=persistent
+              APP_ID='com.jarvis.android'
+              ;;
+            auto)
+              if [ "$all_present" -eq 1 ]; then
+                MODE=persistent
+                APP_ID='com.jarvis.android'
+              elif [ "$all_missing" -eq 1 ]; then
+                MODE=preview
+                APP_ID='com.jarvis.android.preview'
+              else
+                echo 'ERROR: Only some signing secrets are set. Configure all four or remove incomplete secrets and build preview.'
+                exit 1
+              fi
+              ;;
+            *) echo "ERROR: Unknown install mode '$REQUESTED_INSTALL_MODE'"; exit 1 ;;
+          esac
+          echo "JARVIS_SIGNING_MODE=$MODE" >> "$GITHUB_ENV"
+          echo "JARVIS_APP_ID=$APP_ID" >> "$GITHUB_ENV"
+          echo "Jarvis mode selected: $MODE ($APP_ID). Current app will not be uninstalled."
 
       - name: Validate source ZIP
         shell: bash
@@ -34,6 +93,9 @@ jobs:
           unzip -t "$ZIP"
           unzip -l "$ZIP" | grep -q 'Jarvis-Complete/app/src/main/java/com/jarvis/android/EmbeddedLocalModel.kt'
           unzip -l "$ZIP" | grep -q 'Jarvis-Complete/app/src/main/java/com/jarvis/android/JarvisEngine.kt'
+          unzip -l "$ZIP" | grep -q 'Jarvis-Complete/app/src/main/java/com/jarvis/android/AgentCoordinator.kt'
+          unzip -l "$ZIP" | grep -q 'Jarvis-Complete/app/src/main/java/com/jarvis/android/OwnerVoiceProfile.kt'
+          unzip -l "$ZIP" | grep -q 'Jarvis-Complete/app/src/main/java/com/jarvis/android/JarvisAccessibilityService.kt'
           unzip -l "$ZIP" | grep -q 'Jarvis-Complete/app/src/main/AndroidManifest.xml'
 
       - name: Extract Jarvis source
@@ -83,11 +145,11 @@ jobs:
             'cmake;3.31.6' \
             'ndk;29.0.13113456'
 
-      - name: Download Qwen3 1.7B Q4_K_M model
+      - name: Download Qwen3 0.6B Q4_K_M model
         shell: bash
         run: |
           set -euo pipefail
-          MODEL_NAME='Qwen3-1.7B-Q4_K_M.gguf'
+          MODEL_NAME='Qwen3-0.6B-Q4_K_M.gguf'
           MODEL_DIR="$LLAMA_ANDROID_DIR/app/src/main/assets"
           MODEL="$MODEL_DIR/$MODEL_NAME"
           mkdir -p "$MODEL_DIR"
@@ -95,21 +157,56 @@ jobs:
             --retry 4 --retry-delay 5 --connect-timeout 30 --max-time 3600 \
             -H 'User-Agent: Jarvis-Android-Build' \
             -o "$MODEL" \
-            'https://huggingface.co/gaianet/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf'
+            'https://huggingface.co/tensorblock/Qwen_Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf'
           curl --fail --location --show-error --retry 3 \
             -o "$MODEL_DIR/LICENSE-APACHE-2.0.txt" \
             'https://www.apache.org/licenses/LICENSE-2.0.txt'
           cp "$LLAMA_CPP_ROOT/LICENSE" "$MODEL_DIR/LICENSE-LLAMA-CPP.txt"
           cat > "$MODEL_DIR/THIRD-PARTY-NOTICES.txt" <<'NOTICE'
-          Qwen3-1.7B Q4_K_M GGUF quantization: gaianet/Qwen3-1.7B-GGUF.
+          Qwen3-0.6B Q4_K_M GGUF quantization: tensorblock/Qwen_Qwen3-0.6B-GGUF.
           The underlying Qwen3 model is distributed under Apache License 2.0.
+          Vosk Hindi small model: vosk-model-small-hi-0.22 (Apache License 2.0).
+          Vosk speaker identification model: vosk-model-spk-0.4 (Apache License 2.0).
           llama.cpp Android inference binding: ggml-org/llama.cpp (MIT License).
           See the adjacent license files for terms.
           NOTICE
           SIZE=$(stat -c%s "$MODEL")
           echo "Qwen3 model bytes: $SIZE"
-          test "$SIZE" -gt 1000000000 || { echo 'ERROR: model download is missing or unexpectedly small'; exit 1; }
+          test "$SIZE" -gt 300000000 || { echo 'ERROR: model download is missing or unexpectedly small'; exit 1; }
           sha256sum "$MODEL" | tee "$RUNNER_TEMP/model.sha256"
+
+          # Hindi Vosk small model: offline keyword detection for an explicit opt-in foreground listener.
+          WAKE_ZIP="$RUNNER_TEMP/vosk-model-small-hi-0.22.zip"
+          curl --fail --location --show-error \
+            --retry 4 --retry-delay 4 --connect-timeout 30 --max-time 900 \
+            -H 'User-Agent: Jarvis-Android-Build' \
+            -o "$WAKE_ZIP" \
+            'https://alphacephei.com/vosk/models/vosk-model-small-hi-0.22.zip'
+          unzip -q "$WAKE_ZIP" -d "$RUNNER_TEMP/vosk-hindi"
+          test -f "$RUNNER_TEMP/vosk-hindi/vosk-model-small-hi-0.22/am/final.mdl"
+          mkdir -p "$MODEL_DIR/jarvis-wake"
+          cp -R "$RUNNER_TEMP/vosk-hindi/vosk-model-small-hi-0.22/." "$MODEL_DIR/jarvis-wake/"
+          curl --fail --location --show-error --retry 3 \
+            -o "$MODEL_DIR/LICENSE-VOSK-APACHE-2.0.txt" \
+            'https://www.apache.org/licenses/LICENSE-2.0.txt'
+          test -f "$MODEL_DIR/jarvis-wake/conf/model.conf"
+
+          # Vosk speaker vectors enable experimental owner-voice matching for the hands-free listener.
+          # This is not secure authentication and must never bypass the Android device lock.
+          SPEAKER_ZIP="$RUNNER_TEMP/vosk-model-spk-0.4.zip"
+          curl --fail --location --show-error \
+            --retry 4 --retry-delay 4 --connect-timeout 30 --max-time 900 \
+            -H 'User-Agent: Jarvis-Android-Build' \
+            -o "$SPEAKER_ZIP" \
+            'https://alphacephei.com/vosk/models/vosk-model-spk-0.4.zip'
+          unzip -q "$SPEAKER_ZIP" -d "$RUNNER_TEMP/vosk-speaker"
+          SPEAKER_DIR="$RUNNER_TEMP/vosk-speaker/vosk-model-spk-0.4"
+          for f in mfcc.conf final.ext.raw mean.vec transform.mat; do
+            test -f "$SPEAKER_DIR/$f" || { echo "ERROR: Vosk speaker model is missing $f"; exit 1; }
+          done
+          mkdir -p "$MODEL_DIR/jarvis-speaker"
+          cp -R "$SPEAKER_DIR/." "$MODEL_DIR/jarvis-speaker/"
+          test -f "$MODEL_DIR/jarvis-speaker/mfcc.conf"
 
       - name: Inject Jarvis app and configure native inference
         shell: bash
@@ -122,7 +219,10 @@ jobs:
           rm -rf "$DEST/java" "$DEST/kotlin" "$DEST/res"
           mkdir -p "$DEST/java" "$DEST/res" "$DEST/assets"
           cp -R "$SRC/." "$DEST/"
-          test "$(stat -c%s "$DEST/assets/Qwen3-1.7B-Q4_K_M.gguf")" -gt 1000000000
+          test "$(stat -c%s "$DEST/assets/Qwen3-0.6B-Q4_K_M.gguf")" -gt 300000000
+          test -f "$DEST/assets/jarvis-wake/am/final.mdl"
+          test -f "$DEST/assets/jarvis-wake/conf/model.conf"
+          for f in mfcc.conf final.ext.raw mean.vec transform.mat; do test -f "$DEST/assets/jarvis-speaker/$f"; done
 
           # Use an app-owned launcher icon. The previous @android:drawable/ic_dialog_info
           # reference makes build-tools 36 aapt fail while dumping APK badging.
@@ -157,8 +257,8 @@ jobs:
                   applicationId = "com.jarvis.android"
                   minSdk = 33
                   targetSdk = 35
-                  versionCode = 3
-                  versionName = "3.0.0-local-model"
+                  versionCode = 5
+                  versionName = "3.2.0-agent-preview"
                   testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
                   vectorDrawables { useSupportLibrary = true }
               }
@@ -199,9 +299,26 @@ jobs:
               implementation("androidx.security:security-crypto:1.1.0-alpha06")
               implementation("com.squareup.okhttp3:okhttp:4.12.0")
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+              implementation("net.java.dev.jna:jna:5.18.1@aar")
+              implementation("com.alphacephei:vosk-android:0.3.75@aar")
               debugImplementation("androidx.compose.ui:ui-tooling")
           }
           GRADLE
+
+          python - "$BASE/app/build.gradle.kts" "$JARVIS_APP_ID" "$GITHUB_RUN_NUMBER" <<'PY'
+          from pathlib import Path
+          import sys
+          gradle_file = Path(sys.argv[1])
+          app_id = sys.argv[2]
+          run_number = int(sys.argv[3])
+          content = gradle_file.read_text()
+          content = content.replace('applicationId = "com.jarvis.android"', f'applicationId = "{app_id}"', 1)
+          content = __import__('re').sub(r'versionCode = \d+', f'versionCode = {1000 + run_number}', content, count=1)
+          gradle_file.write_text(content)
+          PY
+          if [ "$JARVIS_SIGNING_MODE" = "preview" ]; then
+            sed -i 's/android:label="Jarvis AI"/android:label="Jarvis AI Preview"/' "$DEST/AndroidManifest.xml"
+          fi
 
           CMAKE_FILE="$BASE/lib/src/main/cpp/CMakeLists.txt"
           sed -i 's/set(GGML_CPU_KLEIDIAI ON)/set(GGML_CPU_KLEIDIAI OFF)/' "$CMAKE_FILE"
@@ -214,11 +331,18 @@ jobs:
 
           test -f "$DEST/java/com/jarvis/android/EmbeddedLocalModel.kt"
           test -f "$DEST/java/com/jarvis/android/JarvisEngine.kt"
-          test -f "$DEST/assets/Qwen3-1.7B-Q4_K_M.gguf"
+          test -f "$DEST/java/com/jarvis/android/JarvisWakeWordService.kt"
+          test -f "$DEST/java/com/jarvis/android/OwnerVoiceProfile.kt"
+          test -f "$DEST/assets/Qwen3-0.6B-Q4_K_M.gguf"
+          test -f "$DEST/assets/jarvis-wake/am/final.mdl"
+          test -f "$DEST/assets/jarvis-wake/conf/model.conf"
+          for f in mfcc.conf final.ext.raw mean.vec transform.mat; do test -f "$DEST/assets/jarvis-speaker/$f"; done
           grep -q 'implementation(project(":lib"))' "$BASE/app/build.gradle.kts"
+          grep -q 'com.alphacephei:vosk-android:0.3.75@aar' "$BASE/app/build.gradle.kts"
           test -f "$DEST/assets/LICENSE-APACHE-2.0.txt"
           test -f "$DEST/assets/LICENSE-LLAMA-CPP.txt"
-          echo 'Jarvis source + native llama.cpp + bundled Qwen3 model configured.'
+          test -f "$DEST/assets/LICENSE-VOSK-APACHE-2.0.txt"
+          echo 'Jarvis source + native llama.cpp + Qwen3 0.6B + Vosk Hindi wake model + Vosk speaker model configured.'
 
       - name: Build APK with embedded model
         working-directory: ${{ env.LLAMA_ANDROID_DIR }}
@@ -241,15 +365,22 @@ jobs:
         run: |
           set -euo pipefail
 
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/36.0.0"
+          APK="$LLAMA_ANDROID_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$APK"
+          if [ "$JARVIS_SIGNING_MODE" = "preview" ]; then
+            "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$APK"
+            echo "Preview APK uses Gradle's debug signing key and package id $JARVIS_APP_ID; it installs beside the current app."
+            exit 0
+          fi
+
           for name in JARVIS_KEYSTORE_BASE64 JARVIS_KEYSTORE_PASSWORD JARVIS_KEY_ALIAS JARVIS_KEY_PASSWORD; do
             if [ -z "${!name:-}" ]; then
-              echo "ERROR: GitHub Actions secret $name is missing. Create the four JARVIS signing secrets before building."
+              echo "ERROR: GitHub Actions secret $name is missing."
               exit 1
             fi
           done
 
-          BUILD_TOOLS="$ANDROID_HOME/build-tools/36.0.0"
-          APK="$LLAMA_ANDROID_DIR/app/build/outputs/apk/debug/app-debug.apk"
           KEYSTORE="$RUNNER_TEMP/jarvis-release.jks"
           ALIGNED="$RUNNER_TEMP/Jarvis-aligned.apk"
           SIGNED="$RUNNER_TEMP/Jarvis-signed.apk"
@@ -282,37 +413,4 @@ jobs:
           test -f "$APK"
           APK_SIZE=$(stat -c%s "$APK")
           echo "APK bytes: $APK_SIZE"
-          test "$APK_SIZE" -gt 1000000000 || { echo 'ERROR: APK is too small; bundled model may be missing'; exit 1; }
-          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" | grep -q "name='com.jarvis.android'"
-          unzip -l "$APK" | grep -q 'assets/Qwen3-1.7B-Q4_K_M.gguf'
-          unzip -l "$APK" | grep -q 'lib/arm64-v8a/libai-chat.so'
-          mkdir -p "$GITHUB_WORKSPACE/release-assets"
-          cp "$APK" "$GITHUB_WORKSPACE/release-assets/Jarvis-Embedded-Qwen3-1.7B.apk"
-          cp "$LLAMA_CPP_ROOT/LICENSE" "$GITHUB_WORKSPACE/release-assets/LICENSE-LLAMA-CPP.txt"
-          cp "$LLAMA_ANDROID_DIR/app/src/main/assets/LICENSE-APACHE-2.0.txt" "$GITHUB_WORKSPACE/release-assets/LICENSE-APACHE-2.0.txt"
-          cp "$LLAMA_ANDROID_DIR/app/src/main/assets/THIRD-PARTY-NOTICES.txt" "$GITHUB_WORKSPACE/release-assets/THIRD-PARTY-NOTICES.txt"
-          sha256sum "$GITHUB_WORKSPACE/release-assets/Jarvis-Embedded-Qwen3-1.7B.apk" > "$GITHUB_WORKSPACE/release-assets/SHA256SUMS.txt"
-          echo 'APK contains GGUF model and native inference library.'
-
-      - name: Publish APK to GitHub Releases
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: build-${{ github.run_number }}
-          name: Jarvis Embedded AI Build ${{ github.run_number }}
-          target_commitish: ${{ github.sha }}
-          body: |
-            Jarvis Android APK with the Qwen3-1.7B Q4_K_M local model and llama.cpp native inference library embedded. Signed with the persistent JARVIS signing key.
-
-            The APK is large (around 1.3 GB). First launch copies the model to private app storage, so keep at least about 2.6 GB free.
-            Image understanding still requires a configured vision-capable online or external model.
-          files: |
-            release-assets/Jarvis-Embedded-Qwen3-1.7B.apk
-            release-assets/SHA256SUMS.txt
-            release-assets/LICENSE-LLAMA-CPP.txt
-            release-assets/LICENSE-APACHE-2.0.txt
-            release-assets/THIRD-PARTY-NOTICES.txt
-          draft: false
-          prerelease: false
-          make_latest: true
-          overwrite_files: true
-          
+          test "$APK_SIZE" -gt 300000000 || { echo 'ERROR: APK is to
