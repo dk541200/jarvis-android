@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources><string name="app_name">JARVIS</string><string name="accessibility_description">Allows JARVIS to read visible screen text and perform user-requested actions. It does not bypass secure screens.</string></resources>
