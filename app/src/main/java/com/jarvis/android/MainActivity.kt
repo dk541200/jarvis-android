@@ -154,7 +154,7 @@ private fun JarvisApp(onSpeak:(String)->Unit,onMic:()->Unit){
                                     Button(enabled=prompt.isNotBlank()&&!busy,onClick={
                                         val q=prompt.trim(); prompt=""; busy=true; answer="Thinking…"
                                         scope.launch {
-                                            answer=if(api.isBlank()) localReply(q,context) else OpenRouter.ask(api,q)
+                                            answer=if(api.isBlank()) localReply(q,context) else OpenRouter.ask(api,q,history.takeLast(12))
                                             history.add("You: $q")
                                             history.add("JARVIS: $answer")
                                             saveStoredList(storage, "history", history.takeLast(100))
@@ -183,13 +183,34 @@ private fun JarvisApp(onSpeak:(String)->Unit,onMic:()->Unit){
                         item { Text("YOUR WORKSPACE",color=Cyan,fontWeight=FontWeight.Bold,letterSpacing=2.sp) }
                         item { CardBlock("LOCAL TASKS"){
                             OutlinedTextField(prompt,{prompt=it},Modifier.fillMaxWidth(),placeholder={Text("Add a reminder or task")})
-                            Button(onClick={
-                                if(prompt.isNotBlank()){
-                                    tasks.add(prompt)
-                                    saveStoredList(storage, "tasks", tasks)
-                                    prompt=""
-                                }
-                            },modifier=Modifier.align(Alignment.End)){Text("Add task")}
+                            Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                                Button(
+                                    onClick={
+                                        if(prompt.isNotBlank()){
+                                            tasks.add(prompt)
+                                            saveStoredList(storage, "tasks", tasks)
+                                            prompt=""
+                                        }
+                                    },
+                                    enabled=prompt.isNotBlank(),
+                                    modifier=Modifier.weight(1f)
+                                ){Text("Add task")}
+                                OutlinedButton(
+                                    onClick={
+                                        val reminderText=prompt.trim()
+                                        if(reminderText.isNotBlank()){
+                                            if(scheduleReminder(context, reminderText)){
+                                                val label="Reminder in 10 min: $reminderText"
+                                                tasks.add(label)
+                                                saveStoredList(storage, "tasks", tasks)
+                                                prompt=""
+                                            }
+                                        }
+                                    },
+                                    enabled=prompt.isNotBlank(),
+                                    modifier=Modifier.weight(1f)
+                                ){Text("Remind in 10m")}
+                            }
                             tasks.forEach { Text("• $it",color=Color.White,modifier=Modifier.padding(vertical=4.dp)) }
                         } }
                         item { CardBlock("MEMORY CENTER"){
@@ -267,6 +288,30 @@ private fun saveStoredList(preferences: SharedPreferences, key: String, values: 
     val array = org.json.JSONArray()
     values.forEach { array.put(it) }
     preferences.edit().putString(key, array.toString()).apply()
+}
+
+private fun scheduleReminder(
+    context: android.content.Context,
+    text: String,
+    delayMillis: Long = 10 * 60 * 1000L
+): Boolean {
+    val alarmManager = context.getSystemService(android.content.Context.ALARM_SERVICE) as android.app.AlarmManager
+    val reminderIntent = Intent(context, ReminderReceiver::class.java).putExtra("text", text)
+    val requestCode = (System.currentTimeMillis() and 0x7fffffffL).toInt()
+    val pendingIntent = android.app.PendingIntent.getBroadcast(
+        context,
+        requestCode,
+        reminderIntent,
+        android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+    )
+    return runCatching {
+        alarmManager.setAndAllowWhileIdle(
+            android.app.AlarmManager.RTC_WAKEUP,
+            System.currentTimeMillis() + delayMillis,
+            pendingIntent
+        )
+        true
+    }.getOrDefault(false)
 }
 
 private fun openWeb(context:android.content.Context,q:String){
