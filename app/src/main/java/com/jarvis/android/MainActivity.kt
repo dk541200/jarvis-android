@@ -41,13 +41,22 @@ private val Mint=Color(0xFF42E6A4)
 
 class MainActivity:ComponentActivity(),TextToSpeech.OnInitListener {
     private var tts:TextToSpeech?=null
+    private val recognizedSpeech = mutableStateOf("")
+    private val speechRevision = mutableIntStateOf(0)
     private val micPermission=registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) launchRecognition() else speak("Microphone permission is needed for voice input.")
     }
     override fun onCreate(savedInstanceState:Bundle?){
         super.onCreate(savedInstanceState)
         tts=TextToSpeech(this,this)
-        setContent { JarvisApp(onSpeak={speak(it)},onMic={startVoice()}) }
+        setContent {
+            JarvisApp(
+                onSpeak={speak(it)},
+                onMic={startVoice()},
+                voiceText=recognizedSpeech.value,
+                voiceRevision=speechRevision.intValue
+            )
+        }
     }
     override fun onInit(status:Int){ if(status==TextToSpeech.SUCCESS) tts?.language=Locale("en","IN") }
     private fun speak(text:String){ tts?.speak(text,TextToSpeech.QUEUE_FLUSH,null,"jarvis") }
@@ -77,14 +86,23 @@ class MainActivity:ComponentActivity(),TextToSpeech.OnInitListener {
         super.onActivityResult(requestCode,resultCode,data)
         if(requestCode==77 && resultCode==RESULT_OK){
             val phrase=data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull().orEmpty()
-            if(phrase.isNotBlank()) speak("You said: $phrase. You can send this in chat.")
+            if(phrase.isNotBlank()) {
+                recognizedSpeech.value = phrase
+                speechRevision.intValue += 1
+                speak("Voice input is ready. Review it and press send.")
+            }
         }
     }
     override fun onDestroy(){ tts?.shutdown(); super.onDestroy() }
 }
 
 @Composable
-private fun JarvisApp(onSpeak:(String)->Unit,onMic:()->Unit){
+private fun JarvisApp(
+    onSpeak:(String)->Unit,
+    onMic:()->Unit,
+    voiceText:String,
+    voiceRevision:Int
+){
     var tab by remember { mutableStateOf("Home") }
     var prompt by remember { mutableStateOf("") }
     var api by remember { mutableStateOf("") }
@@ -107,6 +125,9 @@ private fun JarvisApp(onSpeak:(String)->Unit,onMic:()->Unit){
     val tasks= remember(storage) {
         mutableStateListOf<String>().apply { addAll(readStoredList(storage, "tasks")) }
     }
+    LaunchedEffect(voiceRevision) {
+        if (voiceText.isNotBlank()) prompt = voiceText
+    }
     MaterialTheme(colorScheme=darkColorScheme(primary=Cyan,secondary=Mint,background=Ink,surface=Panel)){
         Scaffold(containerColor=Ink,bottomBar={
             NavigationBar(containerColor=Panel){
@@ -123,7 +144,7 @@ private fun JarvisApp(onSpeak:(String)->Unit,onMic:()->Unit){
                         Text("J A R V I S",color=Cyan,fontSize=20.sp,fontWeight=FontWeight.Black,letterSpacing=3.sp)
                         Text("PERSONAL AI SYSTEM  •  ANDROID",color=Color.Gray,fontSize=9.sp,letterSpacing=1.4.sp)
                     }
-                    Surface(color=Mint.copy(.12f),shape=CircleShape){ Text("● READY",Modifier.padding(horizontal=12.dp,vertical=7.dp),color=Mint,fontSize=10.sp,fontWeight=FontWeight.Bold) }
+                    Surface(color=Mint.copy(.12f),shape=CircleShape){ Text("● PREVIEW",Modifier.padding(horizontal=12.dp,vertical=7.dp),color=Mint,fontSize=10.sp,fontWeight=FontWeight.Bold) }
                 }
                 when(tab){
                     "Home" -> {
@@ -171,12 +192,12 @@ private fun JarvisApp(onSpeak:(String)->Unit,onMic:()->Unit){
                     }
                     "Agents" -> LazyColumn(verticalArrangement=Arrangement.spacedBy(12.dp)){
                         item { Text("AGENT CONTROL",color=Cyan,fontWeight=FontWeight.Bold,letterSpacing=2.sp) }
-                        item { AgentCard("Phone Assistant","Open apps, dialer, settings and user-approved screen actions","Available") { tab="Settings" } }
-                        item { AgentCard("Research Agent","Search the web using your browser","Available") { openWeb(context,"") } }
-                        item { AgentCard("Memory Agent","Save and manage local notes","Available") { tab="Activity" } }
+                        item { AgentCard("Phone Assistant","Launch supported apps, open Android settings and hand off to the dialer","Basic controls") { tab="Settings" } }
+                        item { AgentCard("Research Agent","Open a Google search in your browser; results stay in the browser","Browser hand-off") { openWeb(context,"") } }
+                        item { AgentCard("Memory Agent","Save local notes, tasks and recent conversation history","Local storage") { tab="Activity" } }
                         item { AgentCard("Call Assistant","Launch dialer; call audio access depends on Android/carrier","Limited") { context.startActivity(Intent(Intent.ACTION_DIAL)) } }
-                        item { AgentCard("Notification Agent","Optional notification listener permission","Setup required") { context.startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS")) } }
-                        item { AgentCard("Screen Agent","Optional accessibility-based visible screen actions","Setup required") { context.startActivity(Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)) } }
+                        item { AgentCard("Notification Agent","Permission setup only; notification summaries are not implemented yet","Setup only") { context.startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS")) } }
+                        item { AgentCard("Screen Agent","Open Android accessibility settings; screen-action bridge is not implemented yet","Setup only") { context.startActivity(Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)) } }
                         item { AgentCard("TV / Smart Home","No device integration configured","Not connected") { } }
                     }
                     "Activity" -> LazyColumn(verticalArrangement=Arrangement.spacedBy(12.dp)){
@@ -241,7 +262,7 @@ private fun JarvisApp(onSpeak:(String)->Unit,onMic:()->Unit){
                             OutlinedTextField(api,{api=it},Modifier.fillMaxWidth(),placeholder={Text("Paste OpenRouter API key")},singleLine=true)
                             Text("Do not share your API key. Cloud prompts are sent to your chosen model provider.",color=Color.Gray,fontSize=10.sp)
                         } }
-                        item { AgentCard("Accessibility permission","Enable only if you want JARVIS to read visible screen text and perform user-requested actions.","Optional") { context.startActivity(Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)) } }
+                        item { AgentCard("Accessibility permission","Permission setup only in this preview. No screen-control bridge is active yet.","Optional") { context.startActivity(Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)) } }
                         item { AgentCard("Notification access","Allow JARVIS to show notification summaries locally.","Optional") { context.startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS")) } }
                         item { AgentCard("App permissions","Microphone permission is requested when using voice input.","Review") { context.startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))) } }
                         item { AgentCard("Open Android settings","Manage permissions and system access yourself.","Open") { context.startActivity(Intent(android.provider.Settings.ACTION_SETTINGS)) } }
