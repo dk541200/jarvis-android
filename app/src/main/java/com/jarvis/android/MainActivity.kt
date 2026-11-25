@@ -2,6 +2,7 @@ package com.jarvis.android
 
 import android.Manifest
 import android.content.Intent
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Bundle
 import android.speech.RecognizerIntent
@@ -40,7 +41,9 @@ private val Mint=Color(0xFF42E6A4)
 
 class MainActivity:ComponentActivity(),TextToSpeech.OnInitListener {
     private var tts:TextToSpeech?=null
-    private val micPermission=registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private val micPermission=registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) launchRecognition() else speak("Microphone permission is needed for voice input.")
+    }
     override fun onCreate(savedInstanceState:Bundle?){
         super.onCreate(savedInstanceState)
         tts=TextToSpeech(this,this)
@@ -49,14 +52,25 @@ class MainActivity:ComponentActivity(),TextToSpeech.OnInitListener {
     override fun onInit(status:Int){ if(status==TextToSpeech.SUCCESS) tts?.language=Locale("en","IN") }
     private fun speak(text:String){ tts?.speak(text,TextToSpeech.QUEUE_FLUSH,null,"jarvis") }
     private fun startVoice(){
-        micPermission.launch(Manifest.permission.RECORD_AUDIO)
-        if(!SpeechRecognizer.isRecognitionAvailable(this)) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            launchRecognition()
+        } else {
+            micPermission.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+    private fun launchRecognition(){
+        if(!SpeechRecognizer.isRecognitionAvailable(this)) {
+            speak("Speech recognition is not available on this device.")
+            return
+        }
         val i=Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply{
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
             putExtra(RecognizerIntent.EXTRA_PROMPT,"Speak to JARVIS")
         }
         runCatching { startActivityForResult(i,77) }
+            .onFailure { speak("Could not start voice input. Please try again.") }
     }
     @Deprecated("Legacy speech activity result")
     override fun onActivityResult(requestCode:Int,resultCode:Int,data:Intent?){
@@ -77,10 +91,22 @@ private fun JarvisApp(onSpeak:(String)->Unit,onMic:()->Unit){
     var answer by remember { mutableStateOf("Your assistant is ready. Configure your AI provider in Settings.") }
     var busy by remember { mutableStateOf(false) }
     val context= LocalContext.current
+    val storage = remember(context) {
+        context.getSharedPreferences("jarvis_local_data", android.content.Context.MODE_PRIVATE)
+    }
     val scope= rememberCoroutineScope()
-    val history= remember { mutableStateListOf("JARVIS initialized") }
-    val memories= remember { mutableStateListOf<String>() }
-    val tasks= remember { mutableStateListOf<String>() }
+    val history= remember(storage) {
+        mutableStateListOf<String>().apply {
+            addAll(readStoredList(storage, "history"))
+            if (isEmpty()) add("JARVIS initialized")
+        }
+    }
+    val memories= remember(storage) {
+        mutableStateListOf<String>().apply { addAll(readStoredList(storage, "memories")) }
+    }
+    val tasks= remember(storage) {
+        mutableStateListOf<String>().apply { addAll(readStoredList(storage, "tasks")) }
+    }
     MaterialTheme(colorScheme=darkColorScheme(primary=Cyan,secondary=Mint,background=Ink,surface=Panel)){
         Scaffold(containerColor=Ink,bottomBar={
             NavigationBar(containerColor=Panel){
@@ -131,6 +157,7 @@ private fun JarvisApp(onSpeak:(String)->Unit,onMic:()->Unit){
                                             answer=if(api.isBlank()) localReply(q,context) else OpenRouter.ask(api,q)
                                             history.add("You: $q")
                                             history.add("JARVIS: $answer")
+                                            saveStoredList(storage, "history", history.takeLast(100))
                                             busy=false
                                         }
                                     }){Text(if(busy)"Working" else "Send")}
@@ -156,15 +183,30 @@ private fun JarvisApp(onSpeak:(String)->Unit,onMic:()->Unit){
                         item { Text("YOUR WORKSPACE",color=Cyan,fontWeight=FontWeight.Bold,letterSpacing=2.sp) }
                         item { CardBlock("LOCAL TASKS"){
                             OutlinedTextField(prompt,{prompt=it},Modifier.fillMaxWidth(),placeholder={Text("Add a reminder or task")})
-                            Button(onClick={if(prompt.isNotBlank()){tasks.add(prompt);prompt=""}},modifier=Modifier.align(Alignment.End)){Text("Add task")}
+                            Button(onClick={
+                                if(prompt.isNotBlank()){
+                                    tasks.add(prompt)
+                                    saveStoredList(storage, "tasks", tasks)
+                                    prompt=""
+                                }
+                            },modifier=Modifier.align(Alignment.End)){Text("Add task")}
                             tasks.forEach { Text("• $it",color=Color.White,modifier=Modifier.padding(vertical=4.dp)) }
                         } }
                         item { CardBlock("MEMORY CENTER"){
                             OutlinedTextField(prompt,{prompt=it},Modifier.fillMaxWidth(),placeholder={Text("Save a memory")})
-                            Button(onClick={if(prompt.isNotBlank()){memories.add(prompt);prompt=""}},modifier=Modifier.align(Alignment.End)){Text("Save")}
+                            Button(onClick={
+                                if(prompt.isNotBlank()){
+                                    memories.add(prompt)
+                                    saveStoredList(storage, "memories", memories)
+                                    prompt=""
+                                }
+                            },modifier=Modifier.align(Alignment.End)){Text("Save")}
                             memories.forEach { m -> Row(verticalAlignment=Alignment.CenterVertically){
                                 Text(m,Modifier.weight(1f),color=Color.White,fontSize=13.sp)
-                                IconButton(onClick={memories.remove(m)}){Icon(Icons.Default.Delete,null,tint=Color.Gray)}
+                                IconButton(onClick={
+                                    memories.remove(m)
+                                    saveStoredList(storage, "memories", memories)
+                                }){Icon(Icons.Default.Delete,null,tint=Color.Gray)}
                             } }
                         } }
                         item { CardBlock("RECENT ACTIVITY"){
@@ -190,7 +232,7 @@ private fun JarvisApp(onSpeak:(String)->Unit,onMic:()->Unit){
     }
 }
 
-@Composable private fun Quick(label:String,icon:androidx.compose.ui.graphics.vector.ImageVector,onClick:()->Unit){
+@Composable private fun RowScope.Quick(label:String,icon:androidx.compose.ui.graphics.vector.ImageVector,onClick:()->Unit){
     Card(Modifier.weight(1f).clickable(onClick=onClick),colors=CardDefaults.cardColors(containerColor=Panel),shape=RoundedCornerShape(16.dp)){
         Column(Modifier.fillMaxWidth().padding(12.dp),horizontalAlignment=Alignment.CenterHorizontally){
             Icon(icon,null,tint=Cyan); Spacer(Modifier.height(6.dp)); Text(label,color=Color.White,fontSize=10.sp)
@@ -212,6 +254,21 @@ private fun JarvisApp(onSpeak:(String)->Unit,onMic:()->Unit){
         }
     }
 }
+private fun readStoredList(preferences: SharedPreferences, key: String): List<String> = runCatching {
+    val array = org.json.JSONArray(preferences.getString(key, "[]") ?: "[]")
+    buildList {
+        for (index in 0 until array.length()) {
+            array.optString(index).takeIf { it.isNotBlank() }?.let { add(it) }
+        }
+    }
+}.getOrDefault(emptyList())
+
+private fun saveStoredList(preferences: SharedPreferences, key: String, values: List<String>) {
+    val array = org.json.JSONArray()
+    values.forEach { array.put(it) }
+    preferences.edit().putString(key, array.toString()).apply()
+}
+
 private fun openWeb(context:android.content.Context,q:String){
     val url="https://www.google.com/search?q="+Uri.encode(q)
     context.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(url)))
